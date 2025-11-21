@@ -9,41 +9,60 @@ client = OpenAI()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # MCP Server URL
-MCP_SERVER_URL = "http://localhost:8000/mcp"
+MCP_SERVER_URL = "http://10.75.11.84:8000/mcp"
 
 # Store MCP session globally
 mcp_session = None
-connection_task = None
+mcp_exit_stack = None
 
 async def init_mcp_session():
     """Initialize MCP session with proper imports"""
+    global mcp_exit_stack
+    
     try:
         from mcp import ClientSession
         from mcp.client.sse import sse_client
+        import contextlib
         
-        print(f"Attempting to connect to {MCP_SERVER_URL}...")
+        print(f"Connecting to {MCP_SERVER_URL}...")
         
-        # Connect with timeout
-        async with asyncio.timeout(10):  # 10 second timeout
-            sse_context = sse_client(MCP_SERVER_URL)
-            read_stream, write_stream = await sse_context.__aenter__()
+        # Create an exit stack to manage contexts
+        exit_stack = contextlib.AsyncExitStack()
+        mcp_exit_stack = exit_stack
+        
+        try:
+            # Enter the SSE client context
+            read_stream, write_stream = await exit_stack.enter_async_context(
+                sse_client(url=MCP_SERVER_URL)
+            )
             
-            # Create session
-            session = ClientSession(read_stream, write_stream)
-            await session.__aenter__()
+            print("SSE streams established")
             
-            # Initialize
-            await session.initialize()
+            # Enter the ClientSession context
+            session = await exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
             
-            print("MCP session initialized successfully")
+            print("ClientSession created, initializing...")
+            
+            # Initialize the session
+            result = await asyncio.wait_for(session.initialize(), timeout=10.0)
+            
+            print(f"Session initialized! Server info: {result}")
             return session
-        
-    except asyncio.TimeoutError:
-        print("Connection timeout - server may not support SSE at /mcp endpoint")
-        return None
+            
+        except asyncio.TimeoutError:
+            print("Timeout during initialization")
+            await exit_stack.aclose()
+            return None
+        except Exception as e:
+            print(f"Error during connection: {e}")
+            await exit_stack.aclose()
+            raise
+            
     except ImportError as e:
-        print(f"Import error: {e}")
-        print("Please install: pip install mcp httpx-sse")
+        print(f"Missing package: {e}")
+        print("Install with: pip install mcp httpx-sse")
         return None
     except Exception as e:
         print(f"Connection error: {e}")
@@ -54,58 +73,81 @@ async def init_mcp_session():
 @cl.on_chat_start
 async def start():
     """Initialize MCP connection when chat starts"""
-    global mcp_session, connection_task
+    global mcp_session
     
-    # Start connection in background
-    connection_task = asyncio.create_task(init_mcp_session())
+    await cl.Message(
+        content="🔄 **Connecting to FortiManager MCP server...**\n\n*This may take 10-15 seconds*"
+    ).send()
     
-    # Send initial message immediately (don't wait)
-    await cl.Message(content="🔄 Connecting to FortiManager MCP server in background...\n\nYou can start chatting, but tools won't be available until connected.").send()
-    
-    # Wait for connection with timeout
+    # Try to connect with overall timeout
     try:
-        async with asyncio.timeout(5):
-            mcp_session = await connection_task
+        mcp_session = await asyncio.wait_for(init_mcp_session(), timeout=30.0)
     except asyncio.TimeoutError:
-        await cl.Message(content="⚠️ Connection is taking longer than expected. Continuing in background...").send()
+        await cl.Message(
+            content="❌ Connection timeout after 30 seconds.\n\nPlease check if the MCP server is responding properly."
+        ).send()
         return
     
-    # Connection completed
     if mcp_session:
         try:
-            tools_result = await mcp_session.list_tools()
+            # List tools
+            print("Listing tools...")
+            tools_result = await asyncio.wait_for(mcp_session.list_tools(), timeout=10.0)
             
-            if hasattr(tools_result, 'tools'):
+            if hasattr(tools_result, 'tools') and tools_result.tools:
                 tool_names = [tool.name for tool in tools_result.tools]
                 
-                message = f"✅ Connected to FortiManager MCP!\n\n**Available tools ({len(tool_names)}):**\n"
-                for name in tool_names[:10]:  # Show first 10
-                    message += f"• {name}\n"
+                message = f"✅ **Connected to FortiManager MCP!**\n\n"
+                message += f"**Available tools ({len(tool_names)}):**\n\n"
                 
-                if len(tool_names) > 10:
-                    message += f"... and {len(tool_names) - 10} more"
+                # Group tools by category
+                device_tools = [t for t in tool_names if 'device' in t.lower()]
+                policy_tools = [t for t in tool_names if 'policy' in t.lower()]
+                object_tools = [t for t in tool_names if 'object' in t.lower()]
+                monitoring_tools = [t for t in tool_names if 'monitor' in t.lower()]
+                other_tools = [t for t in tool_names if t not in device_tools + policy_tools + object_tools + monitoring_tools]
+                
+                if device_tools:
+                    message += "**Device Tools:**\n" + "\n".join([f"• `{t}`" for t in device_tools[:5]]) + "\n\n"
+                if policy_tools:
+                    message += "**Policy Tools:**\n" + "\n".join([f"• `{t}`" for t in policy_tools[:5]]) + "\n\n"
+                if object_tools:
+                    message += "**Object Tools:**\n" + "\n".join([f"• `{t}`" for t in object_tools[:5]]) + "\n\n"
+                if monitoring_tools:
+                    message += "**Monitoring Tools:**\n" + "\n".join([f"• `{t}`" for t in monitoring_tools[:5]]) + "\n\n"
+                if other_tools:
+                    message += "**Other Tools:**\n" + "\n".join([f"• `{t}`" for t in other_tools[:5]]) + "\n\n"
+                
+                total_shown = len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + len(monitoring_tools[:5]) + len(other_tools[:5])
+                if len(tool_names) > total_shown:
+                    message += f"*...and {len(tool_names) - total_shown} more tools*\n\n"
+                
+                message += "You can now ask me to manage your FortiGate devices!"
                 
                 await cl.Message(content=message).send()
             else:
                 await cl.Message(content="✅ Connected but no tools found.").send()
+                
+        except asyncio.TimeoutError:
+            await cl.Message(content="⚠️ Connected but timeout listing tools.").send()
         except Exception as e:
             await cl.Message(content=f"⚠️ Connected but error listing tools: {str(e)}").send()
+            import traceback
+            traceback.print_exc()
     else:
-        await cl.Message(content="❌ Failed to connect to MCP server. Check console logs.\n\nYou can still chat, but FortiManager tools won't be available.").send()
+        error_msg = f"❌ **Failed to connect to FortiManager MCP**\n\n"
+        error_msg += "Please check:\n"
+        error_msg += f"• Server is running at `{MCP_SERVER_URL}`\n"
+        error_msg += "• Packages installed: `pip install mcp httpx-sse`\n"
+        error_msg += "• Check terminal for detailed error logs\n\n"
+        error_msg += "*You can still chat, but FortiManager tools won't be available.*"
+        
+        await cl.Message(content=error_msg).send()
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    global mcp_session, connection_task
+    global mcp_session
     
-    # Check if connection is still in progress
-    if connection_task and not connection_task.done():
-        await cl.Message(content="⏳ Still connecting to MCP server... Please wait.").send()
-        try:
-            mcp_session = await asyncio.wait_for(connection_task, timeout=10)
-        except asyncio.TimeoutError:
-            await cl.Message(content="❌ Connection timeout. Proceeding without MCP tools.").send()
-    
-    # Continue with or without MCP
     try:
         openai_tools = []
         
@@ -130,7 +172,7 @@ async def on_message(message: cl.Message):
         # Initial API call
         system_content = "You are a helpful assistant"
         if openai_tools:
-            system_content += " with access to FortiManager tools. Use them to help manage and monitor FortiGate devices and policies."
+            system_content += " with access to FortiManager tools. Use them to help manage and monitor FortiGate devices, policies, objects, and more."
         
         messages = [
             {"role": "system", "content": system_content},
@@ -172,12 +214,15 @@ async def on_message(message: cl.Message):
                 tool_args = json.loads(tool_call.function.arguments)
                 
                 await cl.Message(
-                    content=f"🔧 **{tool_name}**\n```json\n{json.dumps(tool_args, indent=2)}\n```"
+                    content=f"🔧 Calling: **{tool_name}**\n```json\n{json.dumps(tool_args, indent=2)}\n```"
                 ).send()
                 
                 try:
-                    # Call MCP tool
-                    result = await mcp_session.call_tool(tool_name, tool_args)
+                    # Call MCP tool with timeout
+                    result = await asyncio.wait_for(
+                        mcp_session.call_tool(tool_name, tool_args),
+                        timeout=30.0
+                    )
                     
                     # Extract content
                     if hasattr(result, 'content'):
@@ -196,11 +241,22 @@ async def on_message(message: cl.Message):
                         "tool_call_id": tool_call.id,
                         "content": tool_response
                     })
-                except Exception as e:
+                    
+                except asyncio.TimeoutError:
+                    error_msg = f"Timeout calling tool {tool_name}"
+                    await cl.Message(content=f"⚠️ {error_msg}").send()
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": f"Error calling tool: {str(e)}"
+                        "content": error_msg
+                    })
+                except Exception as e:
+                    error_msg = f"Error calling tool {tool_name}: {str(e)}"
+                    await cl.Message(content=f"⚠️ {error_msg}").send()
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": error_msg
                     })
             
             # Get next response
@@ -217,3 +273,14 @@ async def on_message(message: cl.Message):
         await cl.Message(content=f"❌ Error: {str(e)}").send()
         import traceback
         traceback.print_exc()
+
+@cl.on_chat_end
+async def end():
+    """Cleanup MCP connection"""
+    global mcp_exit_stack
+    if mcp_exit_stack:
+        try:
+            await mcp_exit_stack.aclose()
+            print("MCP connection closed")
+        except Exception as e:
+            print(f"Error closing connection: {e}")
