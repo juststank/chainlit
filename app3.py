@@ -3,6 +3,7 @@ import json
 import os
 import httpx
 import traceback
+import asyncio
 from openai import AsyncOpenAI
 
 # MCP Imports
@@ -11,7 +12,6 @@ from mcp.client.sse import sse_client
 from mcp.types import CallToolResult, Tool
 
 # Configuration
-# ✅ UPDATED: Pointing to the endpoint you found
 MCP_SERVER_URL = "http://localhost:8000/mcp" 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -20,37 +20,44 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 async def check_server_health(url):
     """
     Diagnostic to check if the server is reachable.
-    We send the 'text/event-stream' header so the server doesn't reject us.
     """
     try:
         async with httpx.AsyncClient() as client:
-            # Connect with stream=True to avoid hanging on an infinite stream
             headers = {"Accept": "text/event-stream"}
-            async with client.stream("GET", url, headers=headers, timeout=5.0) as response:
+            # We use a short timeout here to fail fast if the server is down
+            async with client.stream("GET", url, headers=headers, timeout=3.0) as response:
                 if response.status_code == 200:
                     return True, "✅ Server is healthy and accepting SSE connections."
                 elif response.status_code == 405:
-                    return True, "⚠️ Server found, but method might be wrong (GET vs POST). Trying anyway..."
+                    return True, "⚠️ Server found (405), but continuing..."
                 else:
-                    # Even a 406 or 500 means the server is THERE, just unhappy.
                     return True, f"⚠️ Server reachable (Status {response.status_code}). Proceeding..."
                     
     except httpx.ConnectError:
         return False, "❌ Connection Refused. Is Docker running? Did you map ports (8000:8000)?"
     except httpx.ReadTimeout:
-        # If we time out reading the stream, it actually means we connected successfully!
+        # If we time out reading the stream, it usually means we connected successfully!
         return True, "✅ Server connected (stream active)."
     except Exception as e:
         return False, f"❌ Network Error: {str(e)}"
 
 async def create_mcp_client():
-    # We use the sse_client context manager helper from the mcp SDK
+    # Log progress to help debug hanging
+    print("DEBUG: Connecting to SSE endpoint...")
     sse_ctx = sse_client(MCP_SERVER_URL)
+    
+    print("DEBUG: Establishing connection...")
     (read_stream, write_stream) = await sse_ctx.__aenter__()
     
+    print("DEBUG: Creating ClientSession...")
     session = ClientSession(read_stream, write_stream)
-    await session.initialize()
     
+    print("DEBUG: Initializing Session (Handshake)...")
+    # CRITICAL FIX: Add timeout to initialization
+    # If the server accepts the connection but never sends the handshake, this prevents the hang.
+    await asyncio.wait_for(session.initialize(), timeout=5.0)
+    
+    print("DEBUG: Session Initialized successfully.")
     return session, sse_ctx
 
 @cl.on_chat_start
@@ -59,24 +66,26 @@ async def start():
         await cl.Message("⚠️ Error: OPENAI_API_KEY is missing.").send()
         return
 
-    # --- DIAGNOSTIC STEP ---
+    # 1. Diagnostic Step
     await cl.Message(f"🔄 Attempting to connect to {MCP_SERVER_URL}...").send()
     is_alive, status_msg = await check_server_health(MCP_SERVER_URL)
     
     if not is_alive:
-         await cl.Message(f"{status_msg}\n\n**Troubleshooting:**\n- Ensure Docker is running.\n- Check if the URL is exactly `http://localhost:8000/mcp`.").send()
-         return
-    else:
-         # Optional: Print success status to chat to reassure user
          await cl.Message(f"{status_msg}").send()
-    # -----------------------
+         return # Stop here if server is dead
+    
+    await cl.Message(f"{status_msg}").send()
 
+    # 2. Connect to MCP (Wrapped in Try/Except for detailed errors)
     try:
+        # This is where it was hanging before. Now it has a timeout.
         session, sse_ctx = await create_mcp_client()
         
         cl.user_session.set("mcp_session", session)
         cl.user_session.set("sse_ctx", sse_ctx)
         
+        # 3. List Tools
+        print("DEBUG: Listing tools...")
         tools_response = await session.list_tools()
         tools = tools_response.tools
         cl.user_session.set("mcp_tools", tools)
@@ -86,8 +95,11 @@ async def start():
             content=f"✅ **Connected!**\n\n**Available Tools:**\n" + "\n".join([f"- `{t}`" for t in tool_names])
         ).send()
 
+    except asyncio.TimeoutError:
+        print(f"ERROR: Connection Timed Out.\n{traceback.format_exc()}")
+        await cl.Message("❌ **Connection Timed Out**\nThe server accepted the connection but failed to complete the MCP handshake.\n\n**Check:**\n1. Does your MCP server logs show any errors?\n2. Is the server implementation handling the initialization request?").send()
+    
     except Exception as e:
-        # If it's an ExceptionGroup (Python 3.11+), print sub-exceptions
         error_msg = str(e)
         if hasattr(e, 'exceptions'):
             error_msg = " | ".join([str(sub) for sub in e.exceptions])
@@ -109,20 +121,22 @@ async def main(message: cl.Message):
     session: ClientSession = cl.user_session.get("mcp_session")
     mcp_tools: list[Tool] = cl.user_session.get("mcp_tools")
 
+    # Guard: If session failed to load, warn user but don't crash
     if not session:
-        await cl.Message("No connection to MCP server. Please restart the chat.").send()
-        return
+        await cl.Message("⚠️ No connection to MCP server. I will try to answer without tools.").send()
+        mcp_tools = [] # Empty list so logic below doesn't crash
 
     openai_tools = []
-    for tool in mcp_tools:
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.inputSchema
-            }
-        })
+    if mcp_tools:
+        for tool in mcp_tools:
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
+                }
+            })
 
     messages = cl.user_session.get("messages", [])
     messages.append({"role": "user", "content": message.content})
@@ -140,7 +154,7 @@ async def main(message: cl.Message):
 
         response_message = response.choices[0].message
 
-        if response_message.tool_calls:
+        if response_message.tool_calls and session:
             messages.append(response_message)
 
             for tool_call in response_message.tool_calls:
