@@ -20,40 +20,42 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 async def debug_sse_stream(url):
     """
     Manually connects to the SSE stream to see if ANY data is flowing.
-    This helps detect if Docker/Nginx is buffering the output.
     """
     try:
         print(f"DEBUG: Testing stream at {url}...")
         async with httpx.AsyncClient() as client:
-            async with client.stream("GET", url, headers={"Accept": "text/event-stream"}, timeout=2.0) as response:
+            headers = {"Accept": "text/event-stream"}
+            async with client.stream("GET", url, headers=headers, timeout=5.0) as response:
                 if response.status_code != 200:
                     return False, f"Server returned status {response.status_code} (Not 200)"
                 
-                # Try to read ONE chunk of data
+                print(f"DEBUG: Connection Open (200 OK). Waiting for data...")
+                # Try to read ONE chunk of data to verify flow
                 try:
                     iterator = response.aiter_lines()
-                    first_line = await asyncio.wait_for(iterator.__anext__(), timeout=2.0)
+                    first_line = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
                     print(f"DEBUG: Received first line: {first_line}")
                     return True, "Stream is active"
                 except asyncio.TimeoutError:
-                    return False, "❌ CONNECTION OPEN BUT NO DATA. (Likely Docker Buffering Issue)"
+                    return False, "❌ CONNECTION OPEN BUT NO DATA. (Docker Buffering suspected)"
                 except StopAsyncIteration:
                     return False, "❌ Connection closed immediately by server."
     except Exception as e:
         return False, f"Connection failed: {str(e)}"
 
 async def create_mcp_client():
-    # 1. Connect to SSE Endpoint (with strict timeout)
+    # 1. Connect to SSE Endpoint
     sse_ctx = sse_client(MCP_SERVER_URL)
     
     print("DEBUG: Waiting for SSE handshake (endpoint event)...")
-    # Wrap the context manager entry in a timeout
-    (read_stream, write_stream) = await asyncio.wait_for(sse_ctx.__aenter__(), timeout=5.0)
+    # FIX 1: Increased timeout from 5s to 30s
+    # Docker sometimes delays the first flush of data
+    (read_stream, write_stream) = await asyncio.wait_for(sse_ctx.__aenter__(), timeout=30.0)
     
     # 2. Initialize Session
     print("DEBUG: Initializing ClientSession...")
     session = ClientSession(read_stream, write_stream)
-    await asyncio.wait_for(session.initialize(), timeout=5.0)
+    await asyncio.wait_for(session.initialize(), timeout=30.0)
     
     return session, sse_ctx
 
@@ -71,10 +73,9 @@ async def start():
         is_flowing, debug_msg = await debug_sse_stream(MCP_SERVER_URL)
         
         if not is_flowing:
-             # FIX: Set content property first, then update()
-             msg.content = f"⚠️ **Connection Warning**\n{debug_msg}\n\n**Fix:** The server is reachable (200 OK), but the data is stuck in the buffer.\n\n**Try this in your Dockerfile:**\n`ENV PYTHONUNBUFFERED=1`"
+             # Warning only - we try to proceed anyway
+             msg.content = f"⚠️ **Connection Warning**\n{debug_msg}\n\n**Potential Fix:**\nYour Docker container is likely buffering the output. Add `ENV PYTHONUNBUFFERED=1` to your Dockerfile and rebuild."
              await msg.update()
-             # We try to proceed anyway, but it will likely fail below
 
         # --- PHASE 2: REAL CONNECTION ---
         session, sse_ctx = await create_mcp_client()
@@ -90,13 +91,12 @@ async def start():
 
         tool_names = [t.name for t in tools]
         
-        # FIX: Set content property first, then update()
         msg.content = f"✅ **Connected!**\n\n**Available Tools:**\n" + "\n".join([f"- `{t}`" for t in tool_names])
         await msg.update()
 
     except asyncio.TimeoutError:
         print(f"CRITICAL ERROR: Timed out waiting for MCP Handshake.\n{traceback.format_exc()}")
-        await cl.Message("❌ **Connection Timed Out (Handshake)**\n\nThe server accepted the connection, but we never received the required 'endpoint' event.\n\n**Solution:**\nThis is almost certainly a **Buffering Issue** inside Docker. Use the 'STDIO' transport method instead of SSE, or ensure your server flushes output immediately.").send()
+        await cl.Message("❌ **Connection Timed Out**\n\nThe server accepted the connection (200 OK) but sent no data for 30 seconds.\n\n**REQUIRED FIX:**\n1. Stop your Docker container.\n2. Add `ENV PYTHONUNBUFFERED=1` to your Dockerfile.\n3. Rebuild with `docker compose build`.\n4. Restart `docker compose up -d`.").send()
     
     except Exception as e:
         error_msg = str(e)
