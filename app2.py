@@ -3,72 +3,76 @@ import os
 import json
 import chainlit as cl
 from openai import OpenAI
-from mcp import ClientSession
-from mcp.client.sse import sse_client
+import httpx
 
 client = OpenAI()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Global MCP session
-mcp_session = None
-mcp_context = None
+# MCP Server URL
+MCP_SERVER_URL = "http://localhost:8000"
+
+async def call_mcp_tool(tool_name: str, arguments: dict):
+    """Call MCP tool via HTTP"""
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.post(
+            f"{MCP_SERVER_URL}/call_tool",
+            json={
+                "name": tool_name,
+                "arguments": arguments
+            },
+            timeout=30.0
+        )
+        return response.json()
+
+async def list_mcp_tools():
+    """List available MCP tools"""
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.get(
+            f"{MCP_SERVER_URL}/list_tools",
+            timeout=10.0
+        )
+        return response.json()
 
 @cl.on_chat_start
 async def start():
-    """Initialize MCP connection when chat starts"""
-    global mcp_session, mcp_context
-    
-    # URL of your FortiManager MCP server (adjust port if needed)
-    server_url = "http://localhost:3000/sse"  # Change to your server URL
-    
+    """Test MCP connection when chat starts"""
     try:
-        # Create MCP client connection using SSE
-        mcp_context = sse_client(server_url)
-        read_stream, write_stream = await mcp_context.__aenter__()
-        
-        mcp_session = ClientSession(read_stream, write_stream)
-        await mcp_session.__aenter__()
-        
-        # Initialize the session
-        await mcp_session.initialize()
-        
-        # List available tools
-        tools_result = await mcp_session.list_tools()
-        tool_names = [tool.name for tool in tools_result.tools]
+        tools = await list_mcp_tools()
+        tool_names = [tool["name"] for tool in tools.get("tools", [])]
         
         await cl.Message(
-            content=f"✅ Connected to FortiManager MCP server!\n\n**Available tools:**\n" + 
+            content=f"✅ Connected to FortiManager MCP server at {MCP_SERVER_URL}!\n\n**Available tools:**\n" + 
                     "\n".join([f"- {name}" for name in tool_names])
         ).send()
     except Exception as e:
-        await cl.Message(content=f"❌ Failed to connect to MCP server: {str(e)}").send()
-        raise
+        await cl.Message(
+            content=f"❌ Failed to connect to MCP server: {str(e)}\n\nMake sure the server is running at {MCP_SERVER_URL}"
+        ).send()
+        import traceback
+        print(traceback.format_exc())
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    if not mcp_session:
-        await cl.Message(content="MCP server not connected!").send()
-        return
-    
     try:
-        # Get available tools from MCP server
-        tools_result = await mcp_session.list_tools()
+        # Get available tools
+        tools_response = await list_mcp_tools()
+        tools = tools_response.get("tools", [])
         
-        # Convert MCP tools to OpenAI function format
+        # Convert to OpenAI format
         openai_tools = []
-        for tool in tools_result.tools:
+        for tool in tools:
             openai_tools.append({
                 "type": "function",
                 "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {})
                 }
             })
         
-        # Initial API call with tools
+        # Initial API call
         messages = [
-            {"role": "system", "content": "You are a helpful assistant with access to FortiManager tools. Use them to help manage FortiGate devices."},
+            {"role": "system", "content": "You are a helpful assistant with access to FortiManager tools. Use them to help manage and monitor FortiGate devices."},
             {"role": "user", "content": message.content}
         ]
         
@@ -79,44 +83,47 @@ async def on_message(message: cl.Message):
             temperature=0.2
         )
         
-        # Handle tool calls in a loop
-        max_iterations = 5  # Prevent infinite loops
+        # Handle tool calls
+        max_iterations = 5
         iteration = 0
         
         while response.choices[0].message.tool_calls and iteration < max_iterations:
             iteration += 1
             assistant_message = response.choices[0].message
-            messages.append(assistant_message)
             
-            # Execute each tool call
+            # Convert to dict for JSON serialization
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    } for tc in assistant_message.tool_calls
+                ]
+            })
+            
             for tool_call in assistant_message.tool_calls:
                 tool_name = tool_call.function.name
                 tool_args = json.loads(tool_call.function.arguments)
                 
-                # Show which tool is being called
                 await cl.Message(
-                    content=f"🔧 Calling tool: `{tool_name}`\nArguments: `{json.dumps(tool_args, indent=2)}`"
+                    content=f"🔧 Calling tool: `{tool_name}`\n```json\n{json.dumps(tool_args, indent=2)}\n```"
                 ).send()
                 
                 # Call MCP tool
-                result = await mcp_session.call_tool(tool_name, tool_args)
-                
-                # Extract content from result
-                if hasattr(result, 'content'):
-                    if isinstance(result.content, list):
-                        tool_response = "\n".join([str(item.text) if hasattr(item, 'text') else str(item) for item in result.content])
-                    else:
-                        tool_response = str(result.content)
-                else:
-                    tool_response = str(result)
+                result = await call_mcp_tool(tool_name, tool_args)
                 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": tool_response
+                    "content": json.dumps(result)
                 })
             
-            # Get next response from OpenAI
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
@@ -124,22 +131,9 @@ async def on_message(message: cl.Message):
                 temperature=0.2
             )
         
-        # Send final response
         await cl.Message(content=response.choices[0].message.content).send()
         
     except Exception as e:
         await cl.Message(content=f"❌ Error: {str(e)}").send()
         import traceback
         print(traceback.format_exc())
-
-@cl.on_chat_end
-async def end():
-    """Cleanup MCP connection"""
-    global mcp_session, mcp_context
-    try:
-        if mcp_session:
-            await mcp_session.__aexit__(None, None, None)
-        if mcp_context:
-            await mcp_context.__aexit__(None, None, None)
-    except Exception as e:
-        print(f"Error during cleanup: {e}")
