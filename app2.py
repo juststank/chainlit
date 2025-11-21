@@ -5,7 +5,7 @@ import asyncio
 import chainlit as cl
 from openai import OpenAI
 import httpx
-from typing import Optional
+from typing import Optional, List
 import warnings
 
 # Suppress the httpcore warnings
@@ -19,6 +19,7 @@ MCP_SERVER_URL = "http://localhost:8000/mcp"
 
 # Store MCP session globally
 mcp_session = None
+all_tools = []  # Cache all tools
 
 def parse_sse_response(text: str) -> Optional[dict]:
     """Parse SSE formatted response"""
@@ -32,7 +33,6 @@ def parse_sse_response(text: str) -> Optional[dict]:
                 return json.loads(data_json)
             except json.JSONDecodeError as e:
                 print(f"[ERROR] Failed to parse JSON: {e}")
-                print(f"[ERROR] JSON string: {data_json[:200]}")
                 return None
     
     return None
@@ -78,9 +78,8 @@ class MCPClient:
             async for chunk in response.aiter_text():
                 full_response += chunk
                 
-                # Check if we have a complete message (ends with double newline)
+                # Check if we have a complete message
                 if "\n\n" in full_response:
-                    # Try to parse
                     parsed = parse_sse_response(full_response)
                     if parsed:
                         print(f"[DEBUG] Parsed: {list(parsed.keys())}")
@@ -91,7 +90,6 @@ class MCPClient:
                         if "result" in parsed:
                             return parsed["result"]
                         
-                        # If no result yet, keep collecting
                         full_response = ""
             
             # Try one more time with whatever we have
@@ -103,7 +101,6 @@ class MCPClient:
                     if "result" in parsed:
                         return parsed["result"]
             
-            print(f"[DEBUG] Full response: {full_response[:500]}")
             raise Exception("No valid response received")
     
     async def initialize(self):
@@ -133,6 +130,60 @@ class MCPClient:
         """Close the client"""
         await self.client.aclose()
 
+def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -> List[dict]:
+    """Filter tools based on query relevance"""
+    query_lower = query.lower()
+    keywords = query_lower.split()
+    
+    scored_tools = []
+    for tool in tools:
+        score = 0
+        tool_name = tool.get("name", "").lower()
+        tool_desc = tool.get("description", "").lower()
+        
+        # Exact name match
+        if any(keyword in tool_name for keyword in keywords):
+            score += 10
+        
+        # Description match
+        if any(keyword in tool_desc for keyword in keywords):
+            score += 5
+        
+        # Category matches
+        if "list" in query_lower and "list" in tool_name:
+            score += 3
+        if "create" in query_lower and "create" in tool_name:
+            score += 3
+        if "delete" in query_lower and "delete" in tool_name:
+            score += 3
+        if "update" in query_lower and "update" in tool_name:
+            score += 3
+        
+        # Specific entity matches
+        if "device" in query_lower and "device" in tool_name:
+            score += 8
+        if "policy" in query_lower and "policy" in tool_name:
+            score += 8
+        if "address" in query_lower and "address" in tool_name:
+            score += 8
+        if "service" in query_lower and "service" in tool_name:
+            score += 8
+        if "firewall" in query_lower and "firewall" in tool_name:
+            score += 8
+        
+        if score > 0:
+            scored_tools.append((score, tool))
+    
+    # Sort by score and return top tools
+    scored_tools.sort(reverse=True, key=lambda x: x[0])
+    
+    # If no scored tools, return common list/get tools
+    if not scored_tools:
+        default_tools = [t for t in tools if "list" in t.get("name", "").lower()[:15]]
+        return default_tools[:max_tools]
+    
+    return [tool for score, tool in scored_tools[:max_tools]]
+
 async def init_mcp_session() -> Optional[MCPClient]:
     """Initialize MCP session"""
     try:
@@ -158,7 +209,7 @@ async def init_mcp_session() -> Optional[MCPClient]:
 @cl.on_chat_start
 async def start():
     """Initialize MCP connection when chat starts"""
-    global mcp_session
+    global mcp_session, all_tools
     
     # Check OpenAI API key
     api_key = os.getenv("OPENAI_API_KEY")
@@ -184,52 +235,41 @@ async def start():
         try:
             # List tools
             print("[DEBUG] Listing tools...")
-            tools = await asyncio.wait_for(mcp_session.list_tools(), timeout=15.0)
+            all_tools = await asyncio.wait_for(mcp_session.list_tools(), timeout=15.0)
             
-            if tools:
-                tool_names = [tool.get("name", "unknown") for tool in tools]
+            if all_tools:
+                tool_names = [tool.get("name", "unknown") for tool in all_tools]
                 
                 message = f"✅ **Connected to FortiManager MCP!**\n\n"
-                message += f"**Available tools ({len(tool_names)}):**\n\n"
+                message += f"**Total tools available: {len(tool_names)}**\n\n"
                 
                 # Group by category
                 device_tools = [t for t in tool_names if 'device' in t.lower()]
                 policy_tools = [t for t in tool_names if 'policy' in t.lower()]
-                object_tools = [t for t in tool_names if 'object' in t.lower() or 'address' in t.lower()]
-                monitor_tools = [t for t in tool_names if 'monitor' in t.lower() or 'status' in t.lower()]
-                service_tools = [t for t in tool_names if 'service' in t.lower() and t not in object_tools]
-                other_tools = [t for t in tool_names if t not in device_tools + policy_tools + object_tools + monitor_tools + service_tools]
+                object_tools = [t for t in tool_names if 'address' in t.lower()]
+                service_tools = [t for t in tool_names if 'service' in t.lower() and 'address' not in t.lower()]
                 
-                if device_tools:
-                    message += "**Device Management:**\n" + "\n".join([f"• `{t}`" for t in device_tools[:5]]) + "\n\n"
-                if policy_tools:
-                    message += "**Policy Management:**\n" + "\n".join([f"• `{t}`" for t in policy_tools[:5]]) + "\n\n"
-                if object_tools:
-                    message += "**Object Management:**\n" + "\n".join([f"• `{t}`" for t in object_tools[:5]]) + "\n\n"
-                if service_tools:
-                    message += "**Service Management:**\n" + "\n".join([f"• `{t}`" for t in service_tools[:5]]) + "\n\n"
-                if monitor_tools:
-                    message += "**Monitoring:**\n" + "\n".join([f"• `{t}`" for t in monitor_tools[:5]]) + "\n\n"
-                
-                shown = (len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + 
-                        len(service_tools[:5]) + len(monitor_tools[:5]))
-                if len(tool_names) > shown:
-                    message += f"*...and {len(tool_names) - shown} more tools*\n\n"
+                message += f"• **Device tools:** {len(device_tools)}\n"
+                message += f"• **Policy tools:** {len(policy_tools)}\n"
+                message += f"• **Address/Object tools:** {len(object_tools)}\n"
+                message += f"• **Service tools:** {len(service_tools)}\n"
+                message += f"• **Other tools:** {len(tool_names) - len(device_tools) - len(policy_tools) - len(object_tools) - len(service_tools)}\n\n"
                 
                 message += "**Try asking:**\n"
                 message += "• List all FortiGate devices\n"
                 message += "• Show firewall policies\n"
                 message += "• List internet services\n"
+                message += "• Create an address group\n\n"
+                message += "*Note: Tools are intelligently selected based on your query*"
                 
                 await cl.Message(content=message).send()
             else:
                 await cl.Message(content="✅ Connected but no tools found.").send()
                 
         except asyncio.TimeoutError:
-            await cl.Message(content="⚠️ Connected but timeout listing tools (response too large).").send()
+            await cl.Message(content="⚠️ Connected but timeout listing tools.").send()
         except Exception as e:
             await cl.Message(content=f"⚠️ Connected but error listing tools: {str(e)}").send()
-            print(f"[ERROR] Error listing tools:")
             import traceback
             traceback.print_exc()
     else:
@@ -237,24 +277,26 @@ async def start():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    global mcp_session
+    global mcp_session, all_tools
     
     if not mcp_session:
         await cl.Message(content="❌ Not connected to MCP server. Please restart the chat.").send()
         return
     
     try:
-        # Get available tools
-        tools = await mcp_session.list_tools()
+        # Filter tools based on query
+        relevant_tools = filter_relevant_tools(message.content, all_tools, max_tools=100)
         
-        # Convert MCP tools to OpenAI format
+        print(f"[DEBUG] Filtered to {len(relevant_tools)} relevant tools from {len(all_tools)} total")
+        
+        # Convert to OpenAI format
         openai_tools = []
-        for tool in tools:
+        for tool in relevant_tools:
             openai_tools.append({
                 "type": "function",
                 "function": {
                     "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
+                    "description": tool.get("description", "")[:500],  # Truncate long descriptions
                     "parameters": tool.get("inputSchema", {})
                 }
             })
@@ -312,7 +354,6 @@ async def on_message(message: cl.Message):
                     
                     # Format result
                     if isinstance(result, dict):
-                        # Check for content field (MCP format)
                         if "content" in result:
                             content = result["content"]
                             if isinstance(content, list) and content:
