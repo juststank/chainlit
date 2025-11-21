@@ -5,7 +5,7 @@ import asyncio
 import chainlit as cl
 from openai import OpenAI
 import httpx
-from typing import Optional
+from typing import Optional, AsyncIterator
 
 client = OpenAI()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -15,10 +15,26 @@ MCP_SERVER_URL = "http://localhost:8000/mcp"
 
 # Store MCP session globally
 mcp_session = None
-http_client = None
+
+def parse_sse_event(data: str) -> Optional[dict]:
+    """Parse SSE event data"""
+    lines = data.strip().split('\n')
+    event_data = None
+    
+    for line in lines:
+        if line.startswith('data: '):
+            event_data = line[6:]  # Remove 'data: ' prefix
+            break
+    
+    if event_data:
+        try:
+            return json.loads(event_data)
+        except json.JSONDecodeError:
+            return None
+    return None
 
 class MCPClient:
-    """Simple MCP client using httpx for SSE"""
+    """MCP client using httpx for SSE communication"""
     
     def __init__(self, url: str):
         self.url = url
@@ -26,7 +42,7 @@ class MCPClient:
         self.client = httpx.AsyncClient(timeout=30.0)
         
     async def send_request(self, method: str, params: dict = None) -> dict:
-        """Send a JSON-RPC request to the MCP server"""
+        """Send a JSON-RPC request and parse SSE response"""
         self.request_id += 1
         
         payload = {
@@ -38,28 +54,41 @@ class MCPClient:
         if params:
             payload["params"] = params
         
-        print(f"[DEBUG] Sending request: {method}")
+        print(f"[DEBUG] Sending: {method}")
         
-        response = await self.client.post(
+        async with self.client.stream(
+            "POST",
             self.url,
             json=payload,
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream"
             }
-        )
-        
-        print(f"[DEBUG] Response status: {response.status_code}")
-        
-        if response.status_code != 200:
-            raise Exception(f"HTTP {response.status_code}: {response.text}")
-        
-        result = response.json()
-        
-        if "error" in result:
-            raise Exception(f"MCP Error: {result['error']}")
-        
-        return result.get("result", result)
+        ) as response:
+            if response.status_code != 200:
+                text = await response.aread()
+                raise Exception(f"HTTP {response.status_code}: {text.decode()}")
+            
+            # Read SSE stream
+            buffer = ""
+            async for chunk in response.aiter_text():
+                buffer += chunk
+                
+                # Check if we have a complete event
+                if "\n\n" in buffer or "data: " in buffer:
+                    result = parse_sse_event(buffer)
+                    if result:
+                        print(f"[DEBUG] Received: {result.keys() if isinstance(result, dict) else result}")
+                        
+                        if "error" in result:
+                            raise Exception(f"MCP Error: {result['error']}")
+                        
+                        if "result" in result:
+                            return result["result"]
+                        
+                        return result
+            
+            raise Exception("No valid response received")
     
     async def initialize(self):
         """Initialize the MCP session"""
@@ -98,7 +127,7 @@ async def init_mcp_session() -> Optional[MCPClient]:
         # Initialize
         print("[DEBUG] Initializing MCP session...")
         init_result = await mcp.initialize()
-        print(f"[DEBUG] Initialized: {init_result}")
+        print(f"[DEBUG] Server: {init_result.get('serverInfo', {}).get('name')}")
         
         return mcp
         
@@ -135,14 +164,26 @@ async def start():
                 message = f"✅ **Connected to FortiManager MCP!**\n\n"
                 message += f"**Available tools ({len(tool_names)}):**\n\n"
                 
-                # Show first 20 tools
-                for i, name in enumerate(tool_names[:20], 1):
-                    message += f"{i}. `{name}`\n"
+                # Group by category
+                device_tools = [t for t in tool_names if 'device' in t.lower()]
+                policy_tools = [t for t in tool_names if 'policy' in t.lower()]
+                object_tools = [t for t in tool_names if 'object' in t.lower() or 'address' in t.lower()]
+                monitor_tools = [t for t in tool_names if 'monitor' in t.lower() or 'status' in t.lower()]
                 
-                if len(tool_names) > 20:
-                    message += f"\n*...and {len(tool_names) - 20} more tools*\n\n"
+                if device_tools:
+                    message += "**Device Management:**\n" + "\n".join([f"• `{t}`" for t in device_tools[:5]]) + "\n\n"
+                if policy_tools:
+                    message += "**Policy Management:**\n" + "\n".join([f"• `{t}`" for t in policy_tools[:5]]) + "\n\n"
+                if object_tools:
+                    message += "**Object Management:**\n" + "\n".join([f"• `{t}`" for t in object_tools[:5]]) + "\n\n"
+                if monitor_tools:
+                    message += "**Monitoring:**\n" + "\n".join([f"• `{t}`" for t in monitor_tools[:5]]) + "\n\n"
                 
-                message += "\n**Try asking:**\n"
+                shown = len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + len(monitor_tools[:5])
+                if len(tool_names) > shown:
+                    message += f"*...and {len(tool_names) - shown} more tools*\n\n"
+                
+                message += "**Try asking:**\n"
                 message += "• List all FortiGate devices\n"
                 message += "• Show firewall policies\n"
                 message += "• Get device status\n"
@@ -235,7 +276,15 @@ async def on_message(message: cl.Message):
                     
                     # Format result
                     if isinstance(result, dict):
-                        tool_response = json.dumps(result, indent=2)
+                        # Check for content field (MCP format)
+                        if "content" in result:
+                            content = result["content"]
+                            if isinstance(content, list) and content:
+                                tool_response = content[0].get("text", str(content))
+                            else:
+                                tool_response = str(content)
+                        else:
+                            tool_response = json.dumps(result, indent=2)
                     else:
                         tool_response = str(result)
                     
