@@ -6,8 +6,12 @@ import chainlit as cl
 from openai import OpenAI
 import httpx
 from typing import Optional
+import warnings
 
-client = OpenAI()  # Make sure OPENAI_API_KEY is set in your .env file
+# Suppress the httpcore warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+client = OpenAI()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # MCP Server URL
@@ -70,27 +74,55 @@ class MCPClient:
                 text = await response.aread()
                 raise Exception(f"HTTP {response.status_code}: {text.decode()}")
             
-            # Read SSE stream until we get a result
+            # Read SSE stream
             buffer = ""
+            found_result = False
+            
             async for chunk in response.aiter_text():
                 buffer += chunk
                 
-                # Try to parse when we have data
-                if "data: " in buffer:
-                    result = parse_sse_event(buffer)
-                    if result and ("result" in result or "error" in result):
-                        print(f"[DEBUG] Received: {list(result.keys())}")
-                        
-                        if "error" in result:
-                            raise Exception(f"MCP Error: {result['error']}")
-                        
-                        if "result" in result:
-                            return result["result"]
-                        
-                        return result
-                    buffer = ""  # Clear buffer after parsing
+                # Check if we have complete event(s)
+                while "\n\n" in buffer or "data: " in buffer:
+                    # Try to extract and parse an event
+                    if "data: " in buffer:
+                        # Find the data line
+                        data_start = buffer.find("data: ")
+                        if data_start >= 0:
+                            # Find end of this event (double newline or end of buffer)
+                            event_end = buffer.find("\n\n", data_start)
+                            if event_end < 0:
+                                # Might be incomplete, wait for more data
+                                if len(buffer) > 10000:  # Prevent unbounded growth
+                                    print(f"[WARN] Buffer too large, clearing")
+                                    buffer = ""
+                                break
+                            
+                            # Extract the event
+                            event_text = buffer[data_start:event_end]
+                            buffer = buffer[event_end + 2:]  # Remove processed event
+                            
+                            # Parse the event
+                            result = parse_sse_event(event_text)
+                            if result:
+                                print(f"[DEBUG] Parsed event: {list(result.keys())}")
+                                
+                                if "error" in result:
+                                    raise Exception(f"MCP Error: {result['error']}")
+                                
+                                if "result" in result:
+                                    found_result = True
+                                    return result["result"]
+                    else:
+                        # No data line, skip this part
+                        next_event = buffer.find("\n\n")
+                        if next_event >= 0:
+                            buffer = buffer[next_event + 2:]
+                        else:
+                            break
             
-            raise Exception("No valid response received")
+            if not found_result:
+                print(f"[DEBUG] No result found. Buffer content: {buffer[:500]}")
+                raise Exception("No valid response received")
     
     async def initialize(self):
         """Initialize the MCP session"""
@@ -148,7 +180,7 @@ async def start():
     
     # Check OpenAI API key
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or api_key == "sk-REPLACE_WITH_YOUR_KEY":
+    if not api_key or "REPLACE" in api_key:
         await cl.Message(
             content="❌ **OpenAI API Key not configured!**\n\n"
                     "Please set your OpenAI API key in `.env` file:\n"
@@ -170,7 +202,7 @@ async def start():
         try:
             # List tools
             print("[DEBUG] Listing tools...")
-            tools = await mcp_session.list_tools()
+            tools = await asyncio.wait_for(mcp_session.list_tools(), timeout=10.0)
             
             if tools:
                 tool_names = [tool.get("name", "unknown") for tool in tools]
@@ -209,8 +241,11 @@ async def start():
             else:
                 await cl.Message(content="✅ Connected but no tools found.").send()
                 
+        except asyncio.TimeoutError:
+            await cl.Message(content="⚠️ Connected but timeout listing tools.").send()
         except Exception as e:
             await cl.Message(content=f"⚠️ Connected but error listing tools: {str(e)}").send()
+            print(f"[ERROR] Error listing tools:")
             import traceback
             traceback.print_exc()
     else:
