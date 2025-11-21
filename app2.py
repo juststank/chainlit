@@ -9,7 +9,7 @@ client = OpenAI()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # MCP Server URL
-MCP_SERVER_URL = "http://10.75.11.84:8000/mcp"
+MCP_SERVER_URL = "http://localhost:8000/mcp"
 
 # Store MCP session globally
 mcp_session = None
