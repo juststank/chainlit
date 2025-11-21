@@ -17,95 +17,87 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-async def check_server_health(url):
+async def debug_sse_stream(url):
     """
-    Diagnostic to check if the server is reachable.
+    Manually connects to the SSE stream to see if ANY data is flowing.
+    This helps detect if Docker/Nginx is buffering the output.
     """
     try:
+        print(f"DEBUG: Testing stream at {url}...")
         async with httpx.AsyncClient() as client:
-            headers = {"Accept": "text/event-stream"}
-            # We use a short timeout here to fail fast if the server is down
-            async with client.stream("GET", url, headers=headers, timeout=3.0) as response:
-                if response.status_code == 200:
-                    return True, "✅ Server is healthy and accepting SSE connections."
-                elif response.status_code == 405:
-                    return True, "⚠️ Server found (405), but continuing..."
-                else:
-                    return True, f"⚠️ Server reachable (Status {response.status_code}). Proceeding..."
-                    
-    except httpx.ConnectError:
-        return False, "❌ Connection Refused. Is Docker running? Did you map ports (8000:8000)?"
-    except httpx.ReadTimeout:
-        # If we time out reading the stream, it usually means we connected successfully!
-        return True, "✅ Server connected (stream active)."
+            async with client.stream("GET", url, headers={"Accept": "text/event-stream"}, timeout=2.0) as response:
+                if response.status_code != 200:
+                    return False, f"Server returned status {response.status_code} (Not 200)"
+                
+                # Try to read ONE chunk of data
+                try:
+                    iterator = response.aiter_lines()
+                    first_line = await asyncio.wait_for(iterator.__anext__(), timeout=2.0)
+                    print(f"DEBUG: Received first line: {first_line}")
+                    return True, "Stream is active"
+                except asyncio.TimeoutError:
+                    return False, "❌ CONNECTION OPEN BUT NO DATA. (Likely Docker Buffering Issue)"
+                except StopAsyncIteration:
+                    return False, "❌ Connection closed immediately by server."
     except Exception as e:
-        return False, f"❌ Network Error: {str(e)}"
+        return False, f"Connection failed: {str(e)}"
 
 async def create_mcp_client():
-    # Log progress to help debug hanging
-    print("DEBUG: Connecting to SSE endpoint...")
+    # 1. Connect to SSE Endpoint (with strict timeout)
     sse_ctx = sse_client(MCP_SERVER_URL)
     
-    print("DEBUG: Establishing connection...")
-    (read_stream, write_stream) = await sse_ctx.__aenter__()
+    print("DEBUG: Waiting for SSE handshake (endpoint event)...")
+    # THIS IS THE FIX: Wrap the context manager entry in a timeout
+    # If the server doesn't send the 'endpoint' event in 5s, we abort.
+    (read_stream, write_stream) = await asyncio.wait_for(sse_ctx.__aenter__(), timeout=5.0)
     
-    print("DEBUG: Creating ClientSession...")
+    # 2. Initialize Session
+    print("DEBUG: Initializing ClientSession...")
     session = ClientSession(read_stream, write_stream)
-    
-    print("DEBUG: Initializing Session (Handshake)...")
-    # CRITICAL FIX: Add timeout to initialization
-    # If the server accepts the connection but never sends the handshake, this prevents the hang.
     await asyncio.wait_for(session.initialize(), timeout=5.0)
     
-    print("DEBUG: Session Initialized successfully.")
     return session, sse_ctx
 
 @cl.on_chat_start
 async def start():
-    if not OPENAI_API_KEY:
-        await cl.Message("⚠️ Error: OPENAI_API_KEY is missing.").send()
-        return
-
-    # 1. Diagnostic Step
-    await cl.Message(f"🔄 Attempting to connect to {MCP_SERVER_URL}...").send()
-    is_alive, status_msg = await check_server_health(MCP_SERVER_URL)
-    
-    if not is_alive:
-         await cl.Message(f"{status_msg}").send()
-         return # Stop here if server is dead
-    
-    await cl.Message(f"{status_msg}").send()
-
-    # 2. Connect to MCP (Wrapped in Try/Except for detailed errors)
+    # Use a try/finally block to ENSURE the UI always unlocks
     try:
-        # This is where it was hanging before. Now it has a timeout.
+        if not OPENAI_API_KEY:
+            await cl.Message("⚠️ Error: OPENAI_API_KEY is missing.").send()
+            return
+
+        # --- PHASE 1: DIAGNOSTICS ---
+        msg = await cl.Message(f"🔄 Connecting to {MCP_SERVER_URL}...").send()
+        
+        # Check if data is actually flowing
+        is_flowing, debug_msg = await debug_sse_stream(MCP_SERVER_URL)
+        if not is_flowing:
+             await msg.update(content=f"⚠️ **Connection Warning**\n{debug_msg}\n\n**Fix:** The server is reachable, but it's not sending the initial handshake events. This is usually because Docker is 'buffering' the output.\n\n**Try this in your Dockerfile:**\n`ENV PYTHONUNBUFFERED=1`")
+             # We DO NOT return here, we try the real connection anyway just in case.
+
+        # --- PHASE 2: REAL CONNECTION ---
         session, sse_ctx = await create_mcp_client()
         
+        # Store in session
         cl.user_session.set("mcp_session", session)
         cl.user_session.set("sse_ctx", sse_ctx)
         
-        # 3. List Tools
-        print("DEBUG: Listing tools...")
+        # List Tools
         tools_response = await session.list_tools()
         tools = tools_response.tools
         cl.user_session.set("mcp_tools", tools)
 
         tool_names = [t.name for t in tools]
-        await cl.Message(
-            content=f"✅ **Connected!**\n\n**Available Tools:**\n" + "\n".join([f"- `{t}`" for t in tool_names])
-        ).send()
+        await msg.update(content=f"✅ **Connected!**\n\n**Available Tools:**\n" + "\n".join([f"- `{t}`" for t in tool_names]))
 
     except asyncio.TimeoutError:
-        print(f"ERROR: Connection Timed Out.\n{traceback.format_exc()}")
-        await cl.Message("❌ **Connection Timed Out**\nThe server accepted the connection but failed to complete the MCP handshake.\n\n**Check:**\n1. Does your MCP server logs show any errors?\n2. Is the server implementation handling the initialization request?").send()
+        print(f"CRITICAL ERROR: Timed out waiting for MCP Handshake.\n{traceback.format_exc()}")
+        await cl.Message("❌ **Connection Timed Out (Handshake)**\n\nThe server accepted the connection, but we never received the required 'endpoint' event.\n\n**Solution:**\nThis is almost certainly a **Buffering Issue** inside Docker. Use the 'STDIO' transport method instead of SSE, or ensure your server flushes output immediately.").send()
     
     except Exception as e:
         error_msg = str(e)
-        if hasattr(e, 'exceptions'):
-            error_msg = " | ".join([str(sub) for sub in e.exceptions])
-        
         print(f"Detailed Error:\n{traceback.format_exc()}") 
-        await cl.Message(f"❌ **MCP Connection Failed**\n\nError details: {error_msg}").send()
+        await cl.Message(f"❌ **Connection Failed**\n\nError: {error_msg}").send()
 
 @cl.on_chat_end
 async def end():
@@ -121,10 +113,9 @@ async def main(message: cl.Message):
     session: ClientSession = cl.user_session.get("mcp_session")
     mcp_tools: list[Tool] = cl.user_session.get("mcp_tools")
 
-    # Guard: If session failed to load, warn user but don't crash
     if not session:
-        await cl.Message("⚠️ No connection to MCP server. I will try to answer without tools.").send()
-        mcp_tools = [] # Empty list so logic below doesn't crash
+        await cl.Message("⚠️ No connection to MCP server. Answering without tools.").send()
+        mcp_tools = []
 
     openai_tools = []
     if mcp_tools:
@@ -145,12 +136,20 @@ async def main(message: cl.Message):
     await msg.send()
 
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=openai_tools if openai_tools else None,
-            tool_choice="auto" if openai_tools else "none"
-        )
+        # If we have tools, use them
+        if openai_tools:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                tools=openai_tools,
+                tool_choice="auto"
+            )
+        else:
+            # Fallback for no tools
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages
+            )
 
         response_message = response.choices[0].message
 
@@ -163,7 +162,6 @@ async def main(message: cl.Message):
 
                 async with cl.Step(name=tool_name, type="tool") as step:
                     step.input = arguments
-                    
                     try:
                         result: CallToolResult = await session.call_tool(tool_name, arguments)
                         output_text = ""
@@ -175,7 +173,6 @@ async def main(message: cl.Message):
                                     output_text += "[Image Returned]"
                         else:
                             output_text = "Tool executed successfully."
-                            
                         step.output = output_text
                     except Exception as e:
                         output_text = f"Error: {str(e)}"
@@ -193,16 +190,12 @@ async def main(message: cl.Message):
                 messages=messages,
             )
             final_answer = final_response.choices[0].message.content
-            msg.content = final_answer
-            await msg.update()
-            messages.append({"role": "assistant", "content": final_answer})
-        
         else:
             final_answer = response_message.content
-            msg.content = final_answer
-            await msg.update()
-            messages.append({"role": "assistant", "content": final_answer})
 
+        msg.content = final_answer
+        await msg.update()
+        messages.append({"role": "assistant", "content": final_answer})
         cl.user_session.set("messages", messages)
     
     except Exception as e:
