@@ -47,8 +47,7 @@ async def create_mcp_client():
     sse_ctx = sse_client(MCP_SERVER_URL)
     
     print("DEBUG: Waiting for SSE handshake (endpoint event)...")
-    # THIS IS THE FIX: Wrap the context manager entry in a timeout
-    # If the server doesn't send the 'endpoint' event in 5s, we abort.
+    # Wrap the context manager entry in a timeout
     (read_stream, write_stream) = await asyncio.wait_for(sse_ctx.__aenter__(), timeout=5.0)
     
     # 2. Initialize Session
@@ -60,7 +59,6 @@ async def create_mcp_client():
 
 @cl.on_chat_start
 async def start():
-    # Use a try/finally block to ENSURE the UI always unlocks
     try:
         if not OPENAI_API_KEY:
             await cl.Message("⚠️ Error: OPENAI_API_KEY is missing.").send()
@@ -71,9 +69,12 @@ async def start():
         
         # Check if data is actually flowing
         is_flowing, debug_msg = await debug_sse_stream(MCP_SERVER_URL)
+        
         if not is_flowing:
-             await msg.update(content=f"⚠️ **Connection Warning**\n{debug_msg}\n\n**Fix:** The server is reachable, but it's not sending the initial handshake events. This is usually because Docker is 'buffering' the output.\n\n**Try this in your Dockerfile:**\n`ENV PYTHONUNBUFFERED=1`")
-             # We DO NOT return here, we try the real connection anyway just in case.
+             # FIX: Set content property first, then update()
+             msg.content = f"⚠️ **Connection Warning**\n{debug_msg}\n\n**Fix:** The server is reachable (200 OK), but the data is stuck in the buffer.\n\n**Try this in your Dockerfile:**\n`ENV PYTHONUNBUFFERED=1`"
+             await msg.update()
+             # We try to proceed anyway, but it will likely fail below
 
         # --- PHASE 2: REAL CONNECTION ---
         session, sse_ctx = await create_mcp_client()
@@ -88,7 +89,10 @@ async def start():
         cl.user_session.set("mcp_tools", tools)
 
         tool_names = [t.name for t in tools]
-        await msg.update(content=f"✅ **Connected!**\n\n**Available Tools:**\n" + "\n".join([f"- `{t}`" for t in tool_names]))
+        
+        # FIX: Set content property first, then update()
+        msg.content = f"✅ **Connected!**\n\n**Available Tools:**\n" + "\n".join([f"- `{t}`" for t in tool_names])
+        await msg.update()
 
     except asyncio.TimeoutError:
         print(f"CRITICAL ERROR: Timed out waiting for MCP Handshake.\n{traceback.format_exc()}")
