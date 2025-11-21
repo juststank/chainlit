@@ -20,21 +20,21 @@ MCP_SERVER_URL = "http://localhost:8000/mcp"
 # Store MCP session globally
 mcp_session = None
 
-def parse_sse_event(data: str) -> Optional[dict]:
-    """Parse SSE event data"""
-    lines = data.strip().split('\n')
-    event_data = None
+def parse_sse_response(text: str) -> Optional[dict]:
+    """Parse SSE formatted response"""
+    lines = text.strip().split('\n')
     
     for line in lines:
+        line = line.strip()
         if line.startswith('data: '):
-            event_data = line[6:]  # Remove 'data: ' prefix
-            break
+            data_json = line[6:]  # Remove 'data: ' prefix
+            try:
+                return json.loads(data_json)
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Failed to parse JSON: {e}")
+                print(f"[ERROR] JSON string: {data_json[:200]}")
+                return None
     
-    if event_data:
-        try:
-            return json.loads(event_data)
-        except json.JSONDecodeError:
-            return None
     return None
 
 class MCPClient:
@@ -60,7 +60,6 @@ class MCPClient:
         
         print(f"[DEBUG] Sending: {method}")
         
-        # Use context manager to properly close stream
         async with self.client.stream(
             "POST",
             self.url,
@@ -74,55 +73,38 @@ class MCPClient:
                 text = await response.aread()
                 raise Exception(f"HTTP {response.status_code}: {text.decode()}")
             
-            # Read SSE stream
-            buffer = ""
-            found_result = False
-            
+            # Collect the entire response
+            full_response = ""
             async for chunk in response.aiter_text():
-                buffer += chunk
+                full_response += chunk
                 
-                # Check if we have complete event(s)
-                while "\n\n" in buffer or "data: " in buffer:
-                    # Try to extract and parse an event
-                    if "data: " in buffer:
-                        # Find the data line
-                        data_start = buffer.find("data: ")
-                        if data_start >= 0:
-                            # Find end of this event (double newline or end of buffer)
-                            event_end = buffer.find("\n\n", data_start)
-                            if event_end < 0:
-                                # Might be incomplete, wait for more data
-                                if len(buffer) > 10000:  # Prevent unbounded growth
-                                    print(f"[WARN] Buffer too large, clearing")
-                                    buffer = ""
-                                break
-                            
-                            # Extract the event
-                            event_text = buffer[data_start:event_end]
-                            buffer = buffer[event_end + 2:]  # Remove processed event
-                            
-                            # Parse the event
-                            result = parse_sse_event(event_text)
-                            if result:
-                                print(f"[DEBUG] Parsed event: {list(result.keys())}")
-                                
-                                if "error" in result:
-                                    raise Exception(f"MCP Error: {result['error']}")
-                                
-                                if "result" in result:
-                                    found_result = True
-                                    return result["result"]
-                    else:
-                        # No data line, skip this part
-                        next_event = buffer.find("\n\n")
-                        if next_event >= 0:
-                            buffer = buffer[next_event + 2:]
-                        else:
-                            break
+                # Check if we have a complete message (ends with double newline)
+                if "\n\n" in full_response:
+                    # Try to parse
+                    parsed = parse_sse_response(full_response)
+                    if parsed:
+                        print(f"[DEBUG] Parsed: {list(parsed.keys())}")
+                        
+                        if "error" in parsed:
+                            raise Exception(f"MCP Error: {parsed['error']}")
+                        
+                        if "result" in parsed:
+                            return parsed["result"]
+                        
+                        # If no result yet, keep collecting
+                        full_response = ""
             
-            if not found_result:
-                print(f"[DEBUG] No result found. Buffer content: {buffer[:500]}")
-                raise Exception("No valid response received")
+            # Try one more time with whatever we have
+            if full_response:
+                parsed = parse_sse_response(full_response)
+                if parsed:
+                    if "error" in parsed:
+                        raise Exception(f"MCP Error: {parsed['error']}")
+                    if "result" in parsed:
+                        return parsed["result"]
+            
+            print(f"[DEBUG] Full response: {full_response[:500]}")
+            raise Exception("No valid response received")
     
     async def initialize(self):
         """Initialize the MCP session"""
@@ -202,7 +184,7 @@ async def start():
         try:
             # List tools
             print("[DEBUG] Listing tools...")
-            tools = await asyncio.wait_for(mcp_session.list_tools(), timeout=10.0)
+            tools = await asyncio.wait_for(mcp_session.list_tools(), timeout=15.0)
             
             if tools:
                 tool_names = [tool.get("name", "unknown") for tool in tools]
@@ -215,7 +197,8 @@ async def start():
                 policy_tools = [t for t in tool_names if 'policy' in t.lower()]
                 object_tools = [t for t in tool_names if 'object' in t.lower() or 'address' in t.lower()]
                 monitor_tools = [t for t in tool_names if 'monitor' in t.lower() or 'status' in t.lower()]
-                other_tools = [t for t in tool_names if t not in device_tools + policy_tools + object_tools + monitor_tools]
+                service_tools = [t for t in tool_names if 'service' in t.lower() and t not in object_tools]
+                other_tools = [t for t in tool_names if t not in device_tools + policy_tools + object_tools + monitor_tools + service_tools]
                 
                 if device_tools:
                     message += "**Device Management:**\n" + "\n".join([f"• `{t}`" for t in device_tools[:5]]) + "\n\n"
@@ -223,26 +206,27 @@ async def start():
                     message += "**Policy Management:**\n" + "\n".join([f"• `{t}`" for t in policy_tools[:5]]) + "\n\n"
                 if object_tools:
                     message += "**Object Management:**\n" + "\n".join([f"• `{t}`" for t in object_tools[:5]]) + "\n\n"
+                if service_tools:
+                    message += "**Service Management:**\n" + "\n".join([f"• `{t}`" for t in service_tools[:5]]) + "\n\n"
                 if monitor_tools:
                     message += "**Monitoring:**\n" + "\n".join([f"• `{t}`" for t in monitor_tools[:5]]) + "\n\n"
-                if other_tools and other_tools[:3]:
-                    message += "**Other:**\n" + "\n".join([f"• `{t}`" for t in other_tools[:3]]) + "\n\n"
                 
-                shown = len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + len(monitor_tools[:5]) + len(other_tools[:3])
+                shown = (len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + 
+                        len(service_tools[:5]) + len(monitor_tools[:5]))
                 if len(tool_names) > shown:
                     message += f"*...and {len(tool_names) - shown} more tools*\n\n"
                 
                 message += "**Try asking:**\n"
                 message += "• List all FortiGate devices\n"
                 message += "• Show firewall policies\n"
-                message += "• Get device status\n"
+                message += "• List internet services\n"
                 
                 await cl.Message(content=message).send()
             else:
                 await cl.Message(content="✅ Connected but no tools found.").send()
                 
         except asyncio.TimeoutError:
-            await cl.Message(content="⚠️ Connected but timeout listing tools.").send()
+            await cl.Message(content="⚠️ Connected but timeout listing tools (response too large).").send()
         except Exception as e:
             await cl.Message(content=f"⚠️ Connected but error listing tools: {str(e)}").send()
             print(f"[ERROR] Error listing tools:")
