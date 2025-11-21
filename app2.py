@@ -5,9 +5,9 @@ import asyncio
 import chainlit as cl
 from openai import OpenAI
 import httpx
-from typing import Optional
+from typing import Optional, AsyncIterator
 
-client = OpenAI()  # Make sure OPENAI_API_KEY is set in your .env file
+client = OpenAI()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # MCP Server URL
@@ -56,7 +56,6 @@ class MCPClient:
         
         print(f"[DEBUG] Sending: {method}")
         
-        # Use context manager to properly close stream
         async with self.client.stream(
             "POST",
             self.url,
@@ -70,16 +69,16 @@ class MCPClient:
                 text = await response.aread()
                 raise Exception(f"HTTP {response.status_code}: {text.decode()}")
             
-            # Read SSE stream until we get a result
+            # Read SSE stream
             buffer = ""
             async for chunk in response.aiter_text():
                 buffer += chunk
                 
-                # Try to parse when we have data
-                if "data: " in buffer:
+                # Check if we have a complete event
+                if "\n\n" in buffer or "data: " in buffer:
                     result = parse_sse_event(buffer)
-                    if result and ("result" in result or "error" in result):
-                        print(f"[DEBUG] Received: {list(result.keys())}")
+                    if result:
+                        print(f"[DEBUG] Received: {result.keys() if isinstance(result, dict) else result}")
                         
                         if "error" in result:
                             raise Exception(f"MCP Error: {result['error']}")
@@ -88,7 +87,6 @@ class MCPClient:
                             return result["result"]
                         
                         return result
-                    buffer = ""  # Clear buffer after parsing
             
             raise Exception("No valid response received")
     
@@ -129,9 +127,7 @@ async def init_mcp_session() -> Optional[MCPClient]:
         # Initialize
         print("[DEBUG] Initializing MCP session...")
         init_result = await mcp.initialize()
-        server_name = init_result.get('serverInfo', {}).get('name', 'Unknown')
-        server_version = init_result.get('serverInfo', {}).get('version', 'Unknown')
-        print(f"[DEBUG] Connected to: {server_name} v{server_version}")
+        print(f"[DEBUG] Server: {init_result.get('serverInfo', {}).get('name')}")
         
         return mcp
         
@@ -145,16 +141,6 @@ async def init_mcp_session() -> Optional[MCPClient]:
 async def start():
     """Initialize MCP connection when chat starts"""
     global mcp_session
-    
-    # Check OpenAI API key
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or api_key == "sk-REPLACE_WITH_YOUR_KEY":
-        await cl.Message(
-            content="❌ **OpenAI API Key not configured!**\n\n"
-                    "Please set your OpenAI API key in `.env` file:\n"
-                    "```\nOPENAI_API_KEY=sk-your-actual-key-here\n```"
-        ).send()
-        return
     
     await cl.Message(
         content="🔄 **Connecting to FortiManager MCP server...**"
@@ -183,7 +169,6 @@ async def start():
                 policy_tools = [t for t in tool_names if 'policy' in t.lower()]
                 object_tools = [t for t in tool_names if 'object' in t.lower() or 'address' in t.lower()]
                 monitor_tools = [t for t in tool_names if 'monitor' in t.lower() or 'status' in t.lower()]
-                other_tools = [t for t in tool_names if t not in device_tools + policy_tools + object_tools + monitor_tools]
                 
                 if device_tools:
                     message += "**Device Management:**\n" + "\n".join([f"• `{t}`" for t in device_tools[:5]]) + "\n\n"
@@ -193,10 +178,8 @@ async def start():
                     message += "**Object Management:**\n" + "\n".join([f"• `{t}`" for t in object_tools[:5]]) + "\n\n"
                 if monitor_tools:
                     message += "**Monitoring:**\n" + "\n".join([f"• `{t}`" for t in monitor_tools[:5]]) + "\n\n"
-                if other_tools and other_tools[:3]:
-                    message += "**Other:**\n" + "\n".join([f"• `{t}`" for t in other_tools[:3]]) + "\n\n"
                 
-                shown = len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + len(monitor_tools[:5]) + len(other_tools[:3])
+                shown = len(device_tools[:5]) + len(policy_tools[:5]) + len(object_tools[:5]) + len(monitor_tools[:5])
                 if len(tool_names) > shown:
                     message += f"*...and {len(tool_names) - shown} more tools*\n\n"
                 
