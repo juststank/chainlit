@@ -5,7 +5,7 @@ import asyncio
 import chainlit as cl
 from openai import OpenAI
 import httpx
-from typing import Optional, List
+from typing import Optional, List, Dict
 import warnings
 
 # Suppress the httpcore warnings
@@ -131,57 +131,97 @@ class MCPClient:
         await self.client.aclose()
 
 def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -> List[dict]:
-    """Filter tools based on query relevance"""
+    """Filter tools based on query relevance with category awareness"""
     query_lower = query.lower()
     keywords = query_lower.split()
     
+    # Category-specific keywords mapping
+    category_keywords = {
+        'device': ['device', 'firmware', 'vdom', 'ha', 'hardware', 'model', 'cluster'],
+        'policy': ['policy', 'firewall', 'rule', 'nat', 'snat', 'dnat', 'package'],
+        'object': ['address', 'service', 'zone', 'vip', 'pool', 'schedule'],
+        'provision': ['template', 'provision', 'profile', 'cli template', 'system template'],
+        'monitor': ['monitor', 'status', 'log', 'statistic', 'health', 'task', 'connectivity'],
+        'adom': ['adom', 'workspace', 'revision', 'lock', 'commit'],
+        'security': ['web filter', 'ips', 'antivirus', 'dlp', 'application control', 'waf'],
+        'vpn': ['vpn', 'ipsec', 'ssl-vpn', 'tunnel', 'phase1', 'phase2'],
+        'sdwan': ['sd-wan', 'sdwan', 'wan', 'health check'],
+        'fortiap': ['fortiap', 'wtp', 'wireless'],
+        'fortiswitch': ['fortiswitch', 'switch'],
+        'fortiextender': ['fortiextender', 'extender'],
+        'connector': ['connector', 'fabric', 'aws', 'azure', 'vmware'],
+        'script': ['script', 'cli script', 'execute'],
+        'fortiguard': ['fortiguard', 'update', 'contract', 'threat'],
+        'internet_service': ['internet service', 'cloud service'],
+    }
+    
+    # Detect categories from query
+    detected_categories = set()
+    for category, category_kws in category_keywords.items():
+        if any(kw in query_lower for kw in category_kws):
+            detected_categories.add(category)
+    
+    # Score tools
     scored_tools = []
     for tool in tools:
         score = 0
         tool_name = tool.get("name", "").lower()
         tool_desc = tool.get("description", "").lower()
         
-        # Exact name match
-        if any(keyword in tool_name for keyword in keywords):
-            score += 10
+        # Category match bonus
+        for category in detected_categories:
+            if any(kw in tool_name for kw in category_keywords[category]):
+                score += 15
+            if any(kw in tool_desc for kw in category_keywords[category]):
+                score += 5
         
-        # Description match
-        if any(keyword in tool_desc for keyword in keywords):
-            score += 5
+        # Exact keyword match in name
+        for keyword in keywords:
+            if keyword in tool_name:
+                score += 10
+            if keyword in tool_desc:
+                score += 3
         
-        # Category matches
-        if "list" in query_lower and "list" in tool_name:
-            score += 3
-        if "create" in query_lower and "create" in tool_name:
-            score += 3
-        if "delete" in query_lower and "delete" in tool_name:
-            score += 3
-        if "update" in query_lower and "update" in tool_name:
-            score += 3
+        # Operation type matches
+        operation_types = {
+            'list': ['list', 'get', 'show', 'view'],
+            'create': ['create', 'add', 'new'],
+            'update': ['update', 'modify', 'edit', 'set'],
+            'delete': ['delete', 'remove'],
+            'install': ['install', 'deploy', 'push'],
+            'execute': ['execute', 'run'],
+        }
         
-        # Specific entity matches
-        if "device" in query_lower and "device" in tool_name:
-            score += 8
-        if "policy" in query_lower and "policy" in tool_name:
-            score += 8
-        if "address" in query_lower and "address" in tool_name:
-            score += 8
-        if "service" in query_lower and "service" in tool_name:
-            score += 8
-        if "firewall" in query_lower and "firewall" in tool_name:
-            score += 8
+        for op_type, op_keywords in operation_types.items():
+            if any(op in query_lower for op in op_keywords):
+                if any(op in tool_name for op in op_keywords):
+                    score += 8
+        
+        # Specific entity matches with high priority
+        high_priority_entities = [
+            'device', 'policy', 'firewall', 'address', 'service', 
+            'adom', 'vdom', 'template', 'vpn', 'sdwan'
+        ]
+        
+        for entity in high_priority_entities:
+            if entity in query_lower and entity in tool_name:
+                score += 12
         
         if score > 0:
             scored_tools.append((score, tool))
     
-    # Sort by score and return top tools
+    # Sort by score descending
     scored_tools.sort(reverse=True, key=lambda x: x[0])
     
-    # If no scored tools, return common list/get tools
+    # If no scored tools, return common list/get operations
     if not scored_tools:
-        default_tools = [t for t in tools if "list" in t.get("name", "").lower()[:15]]
+        default_tools = [
+            t for t in tools 
+            if any(op in t.get("name", "").lower() for op in ['list', 'get'])
+        ]
         return default_tools[:max_tools]
     
+    # Return top scored tools
     return [tool for score, tool in scored_tools[:max_tools]]
 
 async def init_mcp_session() -> Optional[MCPClient]:
@@ -240,27 +280,41 @@ async def start():
             if all_tools:
                 tool_names = [tool.get("name", "unknown") for tool in all_tools]
                 
-                message = f"✅ **Connected to FortiManager MCP!**\n\n"
+                message = f"✅ **Connected to FortiManager MCP Server!**\n\n"
                 message += f"**Total tools available: {len(tool_names)}**\n\n"
                 
-                # Group by category
-                device_tools = [t for t in tool_names if 'device' in t.lower()]
-                policy_tools = [t for t in tool_names if 'policy' in t.lower()]
-                object_tools = [t for t in tool_names if 'address' in t.lower()]
-                service_tools = [t for t in tool_names if 'service' in t.lower() and 'address' not in t.lower()]
+                # Categorize tools
+                categories = {
+                    'Device Management': [t for t in tool_names if any(k in t.lower() for k in ['device', 'vdom', 'ha', 'firmware'])],
+                    'Policy Management': [t for t in tool_names if any(k in t.lower() for k in ['policy', 'firewall', 'nat'])],
+                    'Objects': [t for t in tool_names if any(k in t.lower() for k in ['address', 'service']) and 'internet' not in t.lower()],
+                    'Provisioning': [t for t in tool_names if any(k in t.lower() for k in ['template', 'provision'])],
+                    'Security Profiles': [t for t in tool_names if any(k in t.lower() for k in ['webfilter', 'ips', 'antivirus', 'dlp', 'application'])],
+                    'VPN': [t for t in tool_names if 'vpn' in t.lower() or 'ipsec' in t.lower()],
+                    'SD-WAN': [t for t in tool_names if 'sdwan' in t.lower() or 'sd_wan' in t.lower()],
+                    'ADOM': [t for t in tool_names if 'adom' in t.lower()],
+                    'Monitoring': [t for t in tool_names if any(k in t.lower() for k in ['monitor', 'status', 'log', 'statistic'])],
+                    'Internet Services': [t for t in tool_names if 'internet_service' in t.lower()],
+                }
                 
-                message += f"• **Device tools:** {len(device_tools)}\n"
-                message += f"• **Policy tools:** {len(policy_tools)}\n"
-                message += f"• **Address/Object tools:** {len(object_tools)}\n"
-                message += f"• **Service tools:** {len(service_tools)}\n"
-                message += f"• **Other tools:** {len(tool_names) - len(device_tools) - len(policy_tools) - len(object_tools) - len(service_tools)}\n\n"
+                message += "**Tools by category:**\n"
+                for category, tools in categories.items():
+                    if tools:
+                        message += f"• **{category}:** {len(tools)} tools\n"
                 
-                message += "**Try asking:**\n"
+                other_count = len(tool_names) - sum(len(tools) for tools in categories.values())
+                if other_count > 0:
+                    message += f"• **Other:** {other_count} tools\n"
+                
+                message += "\n**Example queries:**\n"
                 message += "• List all FortiGate devices\n"
-                message += "• Show firewall policies\n"
+                message += "• Show firewall policies in the production package\n"
+                message += "• List all ADOMs\n"
+                message += "• Get device status\n"
                 message += "• List internet services\n"
+                message += "• Show VPN tunnels\n"
                 message += "• Create an address group\n\n"
-                message += "*Note: Tools are intelligently selected based on your query*"
+                message += "*💡 Tools are intelligently filtered based on your query*"
                 
                 await cl.Message(content=message).send()
             else:
@@ -288,6 +342,9 @@ async def on_message(message: cl.Message):
         relevant_tools = filter_relevant_tools(message.content, all_tools, max_tools=100)
         
         print(f"[DEBUG] Filtered to {len(relevant_tools)} relevant tools from {len(all_tools)} total")
+        if relevant_tools:
+            top_tools = [t.get("name") for t in relevant_tools[:5]]
+            print(f"[DEBUG] Top 5 tools: {top_tools}")
         
         # Convert to OpenAI format
         openai_tools = []
@@ -296,7 +353,7 @@ async def on_message(message: cl.Message):
                 "type": "function",
                 "function": {
                     "name": tool.get("name", ""),
-                    "description": tool.get("description", "")[:500],  # Truncate long descriptions
+                    "description": tool.get("description", "")[:1000],  # Truncate very long descriptions
                     "parameters": tool.get("inputSchema", {})
                 }
             })
@@ -305,7 +362,12 @@ async def on_message(message: cl.Message):
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful assistant with access to FortiManager tools. Use them to help manage and monitor FortiGate devices, policies, objects, and more."
+                "content": (
+                    "You are a helpful assistant with access to FortiManager tools. "
+                    "Use them to help manage and monitor FortiGate devices, policies, objects, and more. "
+                    "When listing items, present the information in a clear, organized format. "
+                    "For complex data, use tables or bullet points."
+                )
             },
             {"role": "user", "content": message.content}
         ]
@@ -351,57 +413,3 @@ async def on_message(message: cl.Message):
                 try:
                     # Call MCP tool
                     result = await mcp_session.call_tool(tool_name, tool_args)
-                    
-                    # Format result
-                    if isinstance(result, dict):
-                        if "content" in result:
-                            content = result["content"]
-                            if isinstance(content, list) and content:
-                                tool_response = content[0].get("text", str(content))
-                            else:
-                                tool_response = str(content)
-                        else:
-                            tool_response = json.dumps(result, indent=2)
-                    else:
-                        tool_response = str(result)
-                    
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_response
-                    })
-                    
-                except Exception as e:
-                    error_msg = f"Error: {str(e)}"
-                    await cl.Message(content=f"⚠️ {error_msg}").send()
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": error_msg
-                    })
-            
-            # Get next response
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=openai_tools if openai_tools else None,
-                temperature=0.2
-            )
-        
-        await cl.Message(content=response.choices[0].message.content).send()
-        
-    except Exception as e:
-        await cl.Message(content=f"❌ Error: {str(e)}").send()
-        import traceback
-        traceback.print_exc()
-
-@cl.on_chat_end
-async def end():
-    """Cleanup MCP connection"""
-    global mcp_session
-    if mcp_session:
-        try:
-            await mcp_session.close()
-            print("[INFO] MCP connection closed")
-        except Exception as e:
-            print(f"[ERROR] Error closing connection: {e}")
