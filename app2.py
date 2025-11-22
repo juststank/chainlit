@@ -1024,3 +1024,156 @@ if __name__ == "__main__":
 ║  $ chainlit run app.py --host 0.0.0.0 --port 8001          ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
+
+# Add this debug version to see what's going on
+@cl.on_message
+async def on_message(message: cl.Message):
+    """Process user messages and execute operations."""
+    global mcp_session, all_tools
+    
+    if not mcp_session:
+        await cl.Message(content="❌ Not connected. Restart chat.").send()
+        return
+    
+    try:
+        # Filter tools
+        relevant_tools = filter_relevant_tools(message.content, all_tools, max_tools=100)
+        print(f"[INFO] Filtered to {len(relevant_tools)}/{len(all_tools)} tools")
+        
+        # DEBUG: Show which tools were selected
+        if relevant_tools:
+            top_10 = [t.get("name") for t in relevant_tools[:10]]
+            print(f"[DEBUG] Top 10 tools: {top_10}")
+            
+            # Show user what tools are available
+            await cl.Message(
+                content=f"🔍 **Found {len(relevant_tools)} relevant tools**\n"
+                        f"Top matches: `{', '.join(top_10[:5])}`"
+            ).send()
+        else:
+            print("[WARN] No tools filtered!")
+            await cl.Message(content="⚠️ No relevant tools found for this query").send()
+            return
+        
+        # Convert to OpenAI format
+        openai_tools = [{
+            "type": "function",
+            "function": {
+                "name": t.get("name", ""),
+                "description": t.get("description", "")[:1000],
+                "parameters": t.get("inputSchema", {})
+            }
+        } for t in relevant_tools]
+        
+        # DEBUG: Log OpenAI tool count
+        print(f"[DEBUG] Sending {len(openai_tools)} tools to OpenAI")
+        
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a FortiManager assistant with access to management tools.\n\n"
+                    "CRITICAL INSTRUCTIONS:\n"
+                    "- You MUST use the available tools to answer questions\n"
+                    "- DO NOT provide general information - use tools to get real data\n"
+                    "- When asked about devices, policies, ADOMs, etc., ALWAYS call the appropriate tool\n"
+                    "- Example: 'list devices' → call list_devices tool\n"
+                    "- Example: 'show policies' → call list_policies tool\n\n"
+                    "Available tool categories:\n"
+                    "- Device Management: list_devices, get_device, get_device_status\n"
+                    "- Policy Management: list_policies, get_policy_package\n"
+                    "- ADOM: list_adoms, get_adom\n"
+                    "- Objects: list_addresses, list_services\n"
+                    "- Monitoring: get_system_status, list_tasks\n\n"
+                    "REMEMBER: Use tools, don't give generic answers!"
+                )
+            },
+            {"role": "user", "content": message.content}
+        ]
+        
+        print(f"[DEBUG] Calling OpenAI with model: {MODEL}")
+        
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=openai_tools if openai_tools else None,
+            tool_choice="auto",  # Let OpenAI decide
+            temperature=0.2
+        )
+        
+        # DEBUG: Check if tools were called
+        if response.choices[0].message.tool_calls:
+            print(f"[DEBUG] OpenAI called {len(response.choices[0].message.tool_calls)} tools")
+        else:
+            print("[WARN] OpenAI did not call any tools!")
+            print(f"[WARN] OpenAI response: {response.choices[0].message.content[:200]}")
+        
+        # Rest of your existing tool execution code...
+        max_iterations = 5
+        iteration = 0
+        
+        while response.choices[0].message.tool_calls and iteration < max_iterations:
+            iteration += 1
+            assistant_message = response.choices[0].message
+            
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_calls": [{
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                } for tc in assistant_message.tool_calls]
+            })
+            
+            for tool_call in assistant_message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+                
+                await cl.Message(
+                    content=f"🔧 **{tool_name}**\n```json\n{json.dumps(tool_args, indent=2)}\n```"
+                ).send()
+                
+                try:
+                    result = await mcp_session.call_tool(tool_name, tool_args)
+                    
+                    if isinstance(result, dict):
+                        if "content" in result:
+                            content = result["content"]
+                            tool_response = content[0].get("text", str(content)) if isinstance(content, list) and content else str(content)
+                        else:
+                            tool_response = json.dumps(result, indent=2)
+                    else:
+                        tool_response = str(result)
+                    
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_response
+                    })
+                    
+                except Exception as e:
+                    error_msg = f"Error: {str(e)}"
+                    await cl.Message(content=f"⚠️ {error_msg}").send()
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": error_msg
+                    })
+            
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=openai_tools if openai_tools else None,
+                temperature=0.2
+            )
+        
+        if response.choices[0].message.content:
+            await cl.Message(content=response.choices[0].message.content).send()
+        else:
+            await cl.Message(content="✅ Operation completed").send()
+            
+    except Exception as e:
+        await cl.Message(content=f"❌ Error: {str(e)}").send()
+        import traceback
+        traceback.print_exc()
