@@ -354,6 +354,10 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
         tool_name = tool.get("name", "").lower()
         tool_desc = tool.get("description", "").lower()
         
+        # Critical tools always get highest priority
+        if tool.get("name") in critical_tools:
+            score += 50
+        
         # Category match
         for category in detected_categories:
             if any(kw in tool_name for kw in category_keywords[category]):
@@ -391,6 +395,16 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
             'device', 'policy', 'firewall', 'address', 'service', 'adom', 
             'vdom', 'template', 'vpn', 'sdwan', 'ha', 'cluster', 'package',
             'script', 'install', 'workspace', 'route', 'static', 'router'
+        ]
+        
+        # Critical tools that should always be included
+        critical_tools = [
+            'list_devices',
+            'get_device_routing_table',
+            'list_adoms',
+            'list_policy_packages',
+            'list_firewall_policies',
+            'install_policy_package'
         ]
         for entity in high_priority:
             if entity in query_lower and entity in tool_name:
