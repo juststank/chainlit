@@ -577,16 +577,19 @@ async def on_message(message: cl.Message):
                     "→ Step 2: For each package, list_firewall_policies(adom='production', package='pkg_name')\n\n"
                     
                     "**Router Configuration & Static Routes:**\n"
-                    "To get static routes configured in FortiManager device database:\n"
-                    "1. **PRIMARY TOOL:** list_static_routes(adom='X') - Shows actual routes in device DB\n"
-                    "2. get_device_routing_configuration(device_name='Y', adom='X') - Per-device routes\n"
-                    "3. list_static_route_templates(adom='X') - Shows templates only (often empty)\n\n"
+                    "CRITICAL: Static routes are stored PER-DEVICE, not at ADOM level!\n"
+                    "Workflow to get routes:\n"
+                    "1. list_devices(adom='X') - Get device names\n"
+                    "2. get_device_routing_table(device_name='Y', adom='X') - Get routes for specific device\n"
+                    "3. Repeat step 2 for each device if needed\n\n"
                     
-                    "IMPORTANT:\n"
-                    "- list_static_routes → ACTUAL routes in device database\n"
-                    "- list_static_route_templates → Templates (not actual config)\n"
-                    "- get_current_device_config → Device metadata (not router config)\n"
-                    "- Always try list_static_routes FIRST for route queries\n\n"
+                    "Available route tools:\n"
+                    "- get_device_routing_table(device_name, adom) → ACTUAL routes for specific device ✓\n"
+                    "- list_static_route_templates(adom) → Templates only (usually empty) ✗\n"
+                    "- get_device_routing_configuration → May not exist or return errors ✗\n\n"
+                    
+                    "NEVER call list_static_route_templates repeatedly - it shows templates, not routes!\n"
+                    "ALWAYS use get_device_routing_table with a specific device_name.\n\n"
                     
                     "**ADOM Operations:**\n"
                     "- list_adoms() - Show all ADOMs\n"
