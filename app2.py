@@ -28,6 +28,58 @@ integrating three key components:
    - Real-time message streaming
    - Session management and lifecycle handling
 
+TOOL CATEGORIES (590 tools total)
+----------------------------------
+Based on actual MCP server implementation:
+
+Infrastructure Management:
+  • Device Management (65+ tools): list_devices, get_device_details, add_device, etc.
+  • ADOM Management (27+ tools): list_adoms, get_adom_statistics, create_adom, etc.
+  • Provisioning (98+ tools): CLI templates, system templates, certificates
+
+Policy & Security:
+  • Policy Management (50+ tools): list_policy_packages, list_firewall_policies, etc.
+  • Objects (59+ tools): list_firewall_addresses, create_firewall_address, etc.
+  • Security Profiles (27+ tools): IPS, antivirus, web filter, DLP
+
+Network Services:
+  • VPN Management (18+ tools): IPsec, SSL-VPN configuration
+  • SD-WAN (19+ tools): Zones, health checks, services, members
+  • Internet Services: Service groups, custom applications
+
+System Operations:
+  • Monitoring (58+ tools): System status, tasks, logs, statistics
+  • Installation (20+ tools): install_policy_package, install_device_settings
+  • Scripts (12+ tools): create_script, execute_script, list_scripts
+  • Workspace (20+ tools): lock_adom_workspace, commit_adom_workspace
+
+Advanced Features:
+  • FortiGuard (28+ tools): Updates, contracts, threat feeds
+  • Connectors (11+ tools): SDN, cloud, fabric connectors
+  • Meta Fields: Custom metadata and tagging
+  • Docker, CSF, QoS, and more
+
+CRITICAL WORKFLOWS
+------------------
+Policy Operations:
+  IMPORTANT: Policies are stored in packages within ADOMs
+  Always follow this sequence:
+    1. list_policy_packages(adom='X') → get available packages
+    2. list_firewall_policies(adom='X', package='Y') → get policies in package
+
+Installation Operations:
+  For policy installation:
+    1. install_policy_package(package='X', device='Y', adom='Z')
+  For device settings:
+    1. install_device_settings(device='X', adom='Y')
+
+Workspace Operations:
+  For safe editing:
+    1. lock_adom_workspace(adom='X')
+    2. Make changes...
+    3. commit_adom_workspace(adom='X')
+    4. unlock_adom_workspace(adom='X')
+
 VERSION: 1.0.0
 """
 
@@ -124,8 +176,6 @@ class MCPClient:
                 if "\n\n" in full_response:
                     parsed = parse_sse_response(full_response)
                     if parsed:
-                        print(f"[DEBUG] MCP Response keys: {list(parsed.keys())}")
-                        
                         if "error" in parsed:
                             error = parsed['error']
                             raise Exception(
@@ -187,29 +237,106 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
     Filter tools based on query relevance using category-aware scoring.
     
     Reduces 590+ tools to ~100 most relevant for OpenAI's 128 tool limit.
+    Based on actual FortiManager MCP tool implementation.
     """
     query_lower = query.lower()
     keywords = query_lower.split()
     
-    # FortiManager MCP tool categories (590 tools across 24 categories)
+    # Category keywords based on actual MCP tool files
     category_keywords = {
-        'device': ['device', 'firmware', 'vdom', 'ha', 'hardware', 'model', 'cluster', 'revision', 'fortigate', 'fgt'],
-        'policy': ['policy', 'firewall', 'rule', 'nat', 'snat', 'dnat', 'package', 'install', 'central'],
-        'object': ['address', 'service', 'zone', 'vip', 'pool', 'schedule', 'wildcard', 'fqdn', 'geography'],
-        'provision': ['template', 'provision', 'profile', 'cli template', 'system template', 'certificate'],
-        'monitor': ['monitor', 'status', 'log', 'statistic', 'health', 'task', 'connectivity', 'performance'],
-        'adom': ['adom', 'workspace', 'revision', 'lock', 'commit', 'assignment', 'clone'],
-        'security': ['web filter', 'ips', 'antivirus', 'dlp', 'application control', 'waf', 'email filter'],
-        'vpn': ['vpn', 'ipsec', 'ssl-vpn', 'tunnel', 'phase1', 'phase2', 'concentrator', 'forticlient'],
-        'sdwan': ['sd-wan', 'sdwan', 'wan', 'health check', 'sla', 'link'],
+        # Device Management (device_tools.py)
+        'device': [
+            'device', 'fortigate', 'fgt', 'firmware', 'vdom', 'ha', 'hardware', 
+            'model', 'cluster', 'revision', 'serial', 'platform'
+        ],
+        
+        # Policy Management (policy_tools.py)
+        'policy': [
+            'policy', 'firewall', 'rule', 'nat', 'snat', 'dnat', 'package', 
+            'install', 'central', 'consolidated'
+        ],
+        
+        # Objects (object_tools.py, additional_object_tools.py, advanced_object_tools.py)
+        'object': [
+            'address', 'service', 'zone', 'vip', 'pool', 'schedule', 'wildcard', 
+            'fqdn', 'geography', 'addrgrp', 'service group', 'internet service'
+        ],
+        
+        # Provisioning (provisioning_tools.py)
+        'provision': [
+            'template', 'provision', 'profile', 'cli template', 'system template', 
+            'certificate', 'widget', 'admin'
+        ],
+        
+        # Monitoring (monitoring_tools.py)
+        'monitor': [
+            'monitor', 'status', 'log', 'statistic', 'health', 'task', 
+            'connectivity', 'performance', 'dashboard'
+        ],
+        
+        # ADOM Management (adom_tools.py)
+        'adom': [
+            'adom', 'workspace', 'revision', 'lock', 'commit', 'assignment', 
+            'clone', 'administrative domain'
+        ],
+        
+        # Security Profiles (security_tools.py)
+        'security': [
+            'webfilter', 'web filter', 'ips', 'antivirus', 'av', 'dlp', 
+            'application control', 'waf', 'email filter', 'profile group'
+        ],
+        
+        # VPN Management (vpn_tools.py)
+        'vpn': [
+            'vpn', 'ipsec', 'ssl-vpn', 'ssl vpn', 'tunnel', 'phase1', 'phase2', 
+            'concentrator', 'forticlient'
+        ],
+        
+        # SD-WAN (sdwan_tools.py)
+        'sdwan': [
+            'sd-wan', 'sdwan', 'sd wan', 'wan', 'health check', 'sla', 'link', 
+            'traffic class', 'wan profile'
+        ],
+        
+        # Scripts (script_tools.py)
+        'script': [
+            'script', 'cli script', 'execute', 'run', 'jinja'
+        ],
+        
+        # FortiGuard (fortiguard_tools.py)
+        'fortiguard': [
+            'fortiguard', 'update', 'contract', 'threat', 'database', 'license'
+        ],
+        
+        # Installation (installation_tools.py from policy_tools.py)
+        'installation': [
+            'install', 'deploy', 'push', 'preview', 'validate', 'abort'
+        ],
+        
+        # Workspace (workspace_tools.py)
+        'workspace': [
+            'lock', 'unlock', 'commit', 'workspace', 'revert'
+        ],
+        
+        # Connectors (connector_tools.py)
+        'connector': [
+            'connector', 'fabric', 'aws', 'azure', 'vmware', 'sdn', 'cloud'
+        ],
+        
+        # System (system_tools.py)
+        'system': [
+            'system', 'backup', 'restore', 'admin', 'certificate', 'interface',
+            'snmp', 'syslog', 'ntp', 'dns', 'route', 'global'
+        ],
+        
+        # Additional categories
         'fortiap': ['fortiap', 'wtp', 'wireless', 'wifi', 'ssid'],
         'fortiswitch': ['fortiswitch', 'switch', 'port'],
         'fortiextender': ['fortiextender', 'extender', 'lte'],
-        'connector': ['connector', 'fabric', 'aws', 'azure', 'vmware', 'sdn'],
-        'script': ['script', 'cli script', 'execute', 'run'],
-        'fortiguard': ['fortiguard', 'update', 'contract', 'threat', 'database'],
-        'internet_service': ['internet service', 'cloud service', 'saas'],
-        'installation': ['install', 'deploy', 'push', 'preview', 'validate'],
+        'qos': ['qos', 'shaping', 'bandwidth', 'traffic shaping'],
+        'csf': ['csf', 'fabric topology', 'security fabric'],
+        'docker': ['docker', 'container'],
+        'metafield': ['meta', 'metadata', 'tag', 'custom field'],
     }
     
     # Detect relevant categories
@@ -243,12 +370,14 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
         
         # Operation type
         operation_types = {
-            'list': ['list', 'get', 'show', 'view', 'retrieve'],
+            'list': ['list', 'get', 'show', 'view', 'retrieve', 'fetch'],
             'create': ['create', 'add', 'new'],
             'update': ['update', 'modify', 'edit', 'set', 'change'],
             'delete': ['delete', 'remove'],
             'install': ['install', 'deploy', 'push'],
-            'execute': ['execute', 'run'],
+            'execute': ['execute', 'run', 'exec'],
+            'lock': ['lock', 'unlock'],
+            'commit': ['commit', 'revert'],
         }
         
         for op_type, op_keywords in operation_types.items():
@@ -257,7 +386,11 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
                     score += 8
         
         # High-priority entities
-        high_priority = ['device', 'policy', 'firewall', 'address', 'service', 'adom', 'vdom', 'template', 'vpn', 'sdwan', 'ha', 'cluster']
+        high_priority = [
+            'device', 'policy', 'firewall', 'address', 'service', 'adom', 
+            'vdom', 'template', 'vpn', 'sdwan', 'ha', 'cluster', 'package',
+            'script', 'install', 'workspace'
+        ]
         for entity in high_priority:
             if entity in query_lower and entity in tool_name:
                 score += 12
@@ -343,29 +476,40 @@ async def start():
         
         tool_names = [tool.get("name", "unknown") for tool in all_tools]
         
+        # Categorize based on actual tool names
         categories = {
-            'Device Management': [t for t in tool_names if any(k in t.lower() for k in ['device', 'vdom', 'ha', 'firmware'])],
-            'Policy Management': [t for t in tool_names if any(k in t.lower() for k in ['policy', 'firewall', 'nat', 'package'])],
-            'Objects': [t for t in tool_names if any(k in t.lower() for k in ['address', 'service', 'zone', 'vip'])],
-            'Security': [t for t in tool_names if any(k in t.lower() for k in ['ips', 'antivirus', 'webfilter', 'dlp'])],
-            'VPN': [t for t in tool_names if 'vpn' in t.lower() or 'ipsec' in t.lower()],
-            'SD-WAN': [t for t in tool_names if 'sdwan' in t.lower() or 'wan' in t.lower()],
-            'ADOM': [t for t in tool_names if 'adom' in t.lower()],
-            'Monitoring': [t for t in tool_names if any(k in t.lower() for k in ['monitor', 'status', 'log', 'task'])],
+            'Device Management': [t for t in tool_names if any(k in t for k in ['device', 'vdom', 'ha', 'firmware'])],
+            'ADOM Management': [t for t in tool_names if 'adom' in t],
+            'Policy Management': [t for t in tool_names if any(k in t for k in ['policy', 'package'])],
+            'Firewall Objects': [t for t in tool_names if any(k in t for k in ['address', 'service', 'zone', 'vip']) and 'internet' not in t],
+            'Security Profiles': [t for t in tool_names if any(k in t for k in ['ips', 'antivirus', 'webfilter', 'dlp', 'waf', 'profile_group'])],
+            'VPN Management': [t for t in tool_names if 'vpn' in t or 'ipsec' in t],
+            'SD-WAN': [t for t in tool_names if 'sdwan' in t or 'wan' in t or 'traffic_class' in t],
+            'Installation': [t for t in tool_names if 'install' in t],
+            'Workspace & Locking': [t for t in tool_names if any(k in t for k in ['lock', 'unlock', 'commit', 'workspace'])],
+            'CLI Scripts': [t for t in tool_names if 'script' in t],
+            'Monitoring & Tasks': [t for t in tool_names if any(k in t for k in ['monitor', 'status', 'log', 'task', 'statistic'])],
+            'FortiGuard': [t for t in tool_names if 'fortiguard' in t or 'update' in t],
+            'Internet Services': [t for t in tool_names if 'internet_service' in t],
+            'Connectors': [t for t in tool_names if 'connector' in t or 'sdn' in t or 'fabric' in t],
+            'Provisioning': [t for t in tool_names if 'template' in t or 'provision' in t],
+            'System': [t for t in tool_names if any(k in t for k in ['system', 'backup', 'certificate', 'admin'])],
         }
         
         message = f"✅ **Connected!** Total tools: **{len(tool_names)}**\n\n**By category:**\n"
-        for cat, tools in categories.items():
-            if tools:
-                message += f"• **{cat}:** {len(tools)}\n"
+        for cat, tools_list in categories.items():
+            if tools_list:
+                message += f"• **{cat}:** {len(tools_list)}\n"
         
         message += (
             "\n**Example queries:**\n"
             "• List all ADOMs\n"
-            "• List all devices\n"
-            "• Show policies in ADOM <name>\n"
-            "• List policy packages in ADOM <name>\n"
-            "• Get device status\n\n"
+            "• Show devices in production ADOM\n"
+            "• List policies in ADOM [name]\n"
+            "• Get device status for FGT-001\n"
+            "• Show internet service groups\n"
+            "• Create firewall address 10.0.0.0/24\n"
+            "• Install policy package to device\n\n"
             "*💡 Smart filtering: 590 tools → ~100 most relevant per query*"
         )
         
@@ -414,46 +558,73 @@ async def on_message(message: cl.Message):
             {
                 "role": "system",
                 "content": (
-                    "You are a FortiManager assistant with access to management tools.\n\n"
+                    "You are a FortiManager expert assistant with access to 590+ management tools.\n\n"
+                    
                     "**CRITICAL INSTRUCTIONS:**\n"
                     "1. ALWAYS use available tools to get real data - NEVER give generic information\n"
                     "2. When information is missing, use discovery tools first\n"
                     "3. Follow correct multi-step workflows for complex operations\n\n"
+                    
                     "**IMPORTANT WORKFLOWS:**\n\n"
-                    "**For Policy Queries:**\n"
-                    "Policies are stored in policy packages within ADOMs. ALWAYS:\n"
-                    "1. First call list_policy_packages(adom='<adom_name>') to see available packages\n"
-                    "2. Then call list_firewall_policies(adom='<adom_name>', pkg='<package_name>')\n\n"
-                    "Example: User asks 'show policies in ADOM XYZ'\n"
-                    "→ Step 1: list_policy_packages(adom='XYZ')\n"
-                    "→ Step 2: For each package, list_firewall_policies(adom='XYZ', pkg='package_name')\n\n"
-                    "**For Device Queries:**\n"
-                    "- Use list_devices(adom='<adom>') to list devices\n"
-                    "- Use get_device(name='<device_name>', adom='<adom>') for details\n"
-                    "- Use get_device_status for connectivity and status info\n\n"
-                    "**For ADOM Queries:**\n"
-                    "- Use list_adoms() to see all ADOMs\n"
-                    "- Use get_adom(name='<adom_name>') for specific ADOM details\n\n"
-                    "**For Objects:**\n"
-                    "- list_addresses(adom='<adom>') for address objects\n"
-                    "- list_services(adom='<adom>') for service objects\n"
-                    "- list_address_groups(adom='<adom>') for address groups\n\n"
+                    
+                    "**Policy Operations (CRITICAL):**\n"
+                    "Policies are stored in PACKAGES within ADOMs. You MUST:\n"
+                    "1. First call list_policy_packages(adom='<adom_name>') to see packages\n"
+                    "2. Then call list_firewall_policies(adom='<adom_name>', package='<pkg_name>')\n\n"
+                    "Example: User asks 'show policies in ADOM production'\n"
+                    "→ Step 1: list_policy_packages(adom='production')\n"
+                    "→ Step 2: For each package, list_firewall_policies(adom='production', package='pkg_name')\n\n"
+                    
+                    "**Device Operations:**\n"
+                    "- list_devices(adom='<adom>') - List all devices\n"
+                    "- get_device_details(name='<device>', adom='<adom>') - Get device info\n"
+                    "- get_device_status(name='<device>', adom='<adom>') - Check connectivity\n\n"
+                    
+                    "**ADOM Operations:**\n"
+                    "- list_adoms() - Show all ADOMs\n"
+                    "- get_adom_statistics(adom='<name>') - Get ADOM details\n\n"
+                    
+                    "**Object Operations:**\n"
+                    "- list_firewall_addresses(adom='<adom>') - List addresses\n"
+                    "- create_firewall_address(name='X', subnet='10.0.0.0/24', adom='Y')\n"
+                    "- list_internet_service_groups(adom='<adom>') - Internet services\n\n"
+                    
+                    "**Installation Operations:**\n"
+                    "- install_policy_package(package='X', device='Y', adom='Z') - Install policies\n"
+                    "- install_device_settings(device='X', adom='Y') - Install device config\n\n"
+                    
+                    "**Workspace Operations (for safe editing):**\n"
+                    "1. lock_adom_workspace(adom='X') - Lock before changes\n"
+                    "2. Make changes...\n"
+                    "3. commit_adom_workspace(adom='X') - Save changes\n"
+                    "4. unlock_adom_workspace(adom='X') - Release lock\n\n"
+                    
+                    "**Script Operations:**\n"
+                    "- list_scripts(adom='X') - Show CLI scripts\n"
+                    "- execute_script(script='name', adom='X') - Run script\n\n"
+                    
+                    "**Monitoring:**\n"
+                    "- get_system_status() - FortiManager system info\n"
+                    "- list_tasks(limit=10) - Recent tasks\n"
+                    "- get_task_status(task_id=123) - Check task progress\n\n"
+                    
                     "**ERROR HANDLING:**\n"
-                    "If a tool call fails due to missing parameters:\n"
-                    "- Check what prerequisite information you need\n"
-                    "- Use list_* tools to discover required values\n"
-                    "- Example: If you need a package name, call list_policy_packages first\n\n"
-                    "**KEY TOOLS AVAILABLE:**\n"
-                    "- list_adoms, get_adom\n"
-                    "- list_devices, get_device, get_device_status\n"
-                    "- list_policy_packages, list_firewall_policies\n"
-                    "- list_addresses, list_services, list_address_groups\n"
-                    "- get_system_status, list_tasks\n\n"
+                    "If a tool fails due to missing parameters:\n"
+                    "- Use discovery tools first (list_policy_packages before list_firewall_policies)\n"
+                    "- Check if you need to list items before accessing specific ones\n"
+                    "- For policies: ALWAYS list packages first\n\n"
+                    
+                    "**PRESENTATION:**\n"
+                    "- Use markdown tables for structured data\n"
+                    "- Use bullet points for lists\n"
+                    "- Highlight important info with **bold**\n"
+                    "- Provide context and explanations\n\n"
+                    
                     "**REMEMBER:**\n"
                     "- Multi-step operations are NORMAL and EXPECTED\n"
                     "- Discovery before details: list packages before policies\n"
                     "- Always specify adom parameter when required\n"
-                    "- Present results in clear, formatted tables when appropriate"
+                    "- Tool names use underscores: list_policy_packages NOT list-policy-packages"
                 )
             },
             {"role": "user", "content": message.content}
