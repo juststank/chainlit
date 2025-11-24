@@ -390,7 +390,7 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
         high_priority = [
             'device', 'policy', 'firewall', 'address', 'service', 'adom', 
             'vdom', 'template', 'vpn', 'sdwan', 'ha', 'cluster', 'package',
-            'script', 'install', 'workspace'
+            'script', 'install', 'workspace', 'route', 'static', 'router'
         ]
         for entity in high_priority:
             if entity in query_lower and entity in tool_name:
