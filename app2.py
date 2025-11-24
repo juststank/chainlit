@@ -326,7 +326,8 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
         # System (system_tools.py)
         'system': [
             'system', 'backup', 'restore', 'admin', 'certificate', 'interface',
-            'snmp', 'syslog', 'ntp', 'dns', 'route', 'global'
+            'snmp', 'syslog', 'ntp', 'dns', 'route', 'global', 'static route',
+            'routing', 'gateway'
         ],
         
         # Additional categories
@@ -589,6 +590,13 @@ async def on_message(message: cl.Message):
                     "- create_firewall_address(name='X', subnet='10.0.0.0/24', adom='Y')\n"
                     "- list_internet_service_groups(adom='<adom>') - Internet services\n\n"
                     
+                    "**Network Configuration:**\n"
+                    "For static routes, interfaces, zones - these are usually in:\n"
+                    "- Device-level configuration tools (check device_* tools)\n"
+                    "- System configuration tools (check system_* tools)\n"
+                    "- Provisioning templates (check *_template tools)\n"
+                    "If one tool returns empty, try related tools before concluding nothing exists.\n\n"
+                    
                     "**Installation Operations:**\n"
                     "- install_policy_package(package='X', device='Y', adom='Z') - Install policies\n"
                     "- install_device_settings(device='X', adom='Y') - Install device config\n\n"
@@ -613,6 +621,22 @@ async def on_message(message: cl.Message):
                     "- Use discovery tools first (list_policy_packages before list_firewall_policies)\n"
                     "- Check if you need to list items before accessing specific ones\n"
                     "- For policies: ALWAYS list packages first\n\n"
+                    
+                    "**CRITICAL - Templates vs Actual Configuration:**\n"
+                    "Tools with '_template' suffix show TEMPLATES, not actual configuration!\n"
+                    "- list_static_route_templates → Shows route TEMPLATES (often empty)\n"
+                    "- list_static_routes or get_device_routes → Shows ACTUAL routes\n"
+                    "- list_interface_templates → TEMPLATES\n"
+                    "- list_interfaces or get_device_interfaces → ACTUAL config\n\n"
+                    
+                    "**IMPORTANT - Empty Results:**\n"
+                    "If a tool returns empty or no results:\n"
+                    "- DON'T immediately conclude nothing exists\n"
+                    "- Check if you called a *_template tool (shows templates, not actual config)\n"
+                    "- Try the non-template version: remove '_template' or try 'get_device_*'\n"
+                    "- Example: list_static_route_templates is empty → try list_static_routes\n"
+                    "- Try device-level tools: get_device_* or device-specific queries\n"
+                    "- Try multiple variations before concluding nothing exists\n\n"
                     
                     "**PRESENTATION:**\n"
                     "- Use markdown tables for structured data\n"
