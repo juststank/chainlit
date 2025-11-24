@@ -649,6 +649,14 @@ async def on_message(message: cl.Message):
                     "- Try device-level tools: get_device_* or device-specific queries\n"
                     "- Try multiple variations before concluding nothing exists\n\n"
                     
+                    "**EFFICIENCY - Minimize Tool Calls:**\n"
+                    "Be strategic to avoid hitting iteration limits:\n"
+                    "1. Call tools in logical batches when possible\n"
+                    "2. If a tool returns complete data, use it - don't call more tools\n"
+                    "3. For 'show X for all devices' - get device list ONCE, then query each\n"
+                    "4. If you get full config with get_current_device_config, parse it - don't call more tools\n"
+                    "5. Prioritize tools likely to have the data over trial-and-error\n\n"
+                    
                     "**PRESENTATION:**\n"
                     "- Use markdown tables for structured data\n"
                     "- Use bullet points for lists\n"
@@ -680,14 +688,20 @@ async def on_message(message: cl.Message):
         else:
             print(f"[DEBUG] OpenAI called {len(response.choices[0].message.tool_calls)} tools")
         
-        max_iterations = 5
+        max_iterations = 10  # Increased for complex FortiManager operations
         iteration = 0
         
         while response.choices[0].message.tool_calls and iteration < max_iterations:
             iteration += 1
             assistant_message = response.choices[0].message
             
-            print(f"[INFO] Iteration {iteration}: {len(assistant_message.tool_calls)} tool calls")
+            print(f"[INFO] Iteration {iteration}/{max_iterations}: {len(assistant_message.tool_calls)} tool calls")
+            
+            # Warn user if approaching limit
+            if iteration >= max_iterations - 2:
+                await cl.Message(
+                    content=f"⚠️ Iteration {iteration}/{max_iterations} - Complex operation, may need simplification"
+                ).send()
             
             messages.append({
                 "role": "assistant",
@@ -748,7 +762,16 @@ async def on_message(message: cl.Message):
         
         if iteration >= max_iterations and response.choices[0].message.tool_calls:
             await cl.Message(
-                content="⚠️ **Reached iteration limit**\nOperation was complex. Try breaking it into smaller queries."
+                content=(
+                    f"⚠️ **Reached iteration limit ({max_iterations})**\n\n"
+                    "The operation was very complex. Try:\n"
+                    "• Break query into smaller parts\n"
+                    "• Be more specific (e.g., specify device name)\n"
+                    "• Ask for one thing at a time\n"
+                    "• Use simpler queries\n\n"
+                    "Example: Instead of 'show everything in ADOM X',\n"
+                    "try 'list devices in ADOM X' first, then ask about specific device."
+                )
             ).send()
         
         if response.choices[0].message.content:
