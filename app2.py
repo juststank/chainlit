@@ -346,6 +346,23 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
         if any(kw in query_lower for kw in category_kws):
             detected_categories.add(category)
     
+    # High-priority entities
+    high_priority = [
+        'device', 'policy', 'firewall', 'address', 'service', 'adom', 
+        'vdom', 'template', 'vpn', 'sdwan', 'ha', 'cluster', 'package',
+        'script', 'install', 'workspace', 'route', 'static', 'router'
+    ]
+    
+    # Critical tools that should always be included
+    critical_tools = [
+        'list_devices',
+        'get_device_routing_table',
+        'list_adoms',
+        'list_policy_packages',
+        'list_firewall_policies',
+        'install_policy_package'
+    ]
+    
     # Score tools
     scored_tools: List[Tuple[int, dict]] = []
     
@@ -390,22 +407,7 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
                 if any(op in tool_name for op in op_keywords):
                     score += 8
         
-        # High-priority entities
-        high_priority = [
-            'device', 'policy', 'firewall', 'address', 'service', 'adom', 
-            'vdom', 'template', 'vpn', 'sdwan', 'ha', 'cluster', 'package',
-            'script', 'install', 'workspace', 'route', 'static', 'router'
-        ]
-        
-        # Critical tools that should always be included
-        critical_tools = [
-            'list_devices',
-            'get_device_routing_table',
-            'list_adoms',
-            'list_policy_packages',
-            'list_firewall_policies',
-            'install_policy_package'
-        ]
+        # High-priority entity boost
         for entity in high_priority:
             if entity in query_lower and entity in tool_name:
                 score += 12
