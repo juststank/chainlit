@@ -649,6 +649,16 @@ async def on_message(message: cl.Message):
                     "- Try device-level tools: get_device_* or device-specific queries\n"
                     "- Try multiple variations before concluding nothing exists\n\n"
                     
+                    "**CRITICAL - Use Data You Already Have:**\n"
+                    "When a tool returns data, PARSE IT and USE IT - don't call more tools!\n"
+                    "Common mistake: Getting full config, then calling specific config tools.\n"
+                    "Example:\n"
+                    "- get_current_device_config returns FULL device config (includes routes)\n"
+                    "- DON'T then call get_device_routing_configuration\n"
+                    "- Instead: Parse the JSON from get_current_device_config\n"
+                    "- Look for 'router' section with 'static' routes\n"
+                    "- Extract and present the routes from that data\n\n"
+                    
                     "**EFFICIENCY - Minimize Tool Calls:**\n"
                     "Be strategic to avoid hitting iteration limits:\n"
                     "1. Call tools in logical batches when possible\n"
@@ -678,7 +688,7 @@ async def on_message(message: cl.Message):
             messages=messages,
             tools=openai_tools if openai_tools else None,
             tool_choice="auto",
-            temperature=0.2
+            temperature=0.1  # Lower for more focused, deterministic responses
         )
         
         # Check if OpenAI called any tools
@@ -757,7 +767,7 @@ async def on_message(message: cl.Message):
                 model=MODEL,
                 messages=messages,
                 tools=openai_tools if openai_tools else None,
-                temperature=0.2
+                temperature=0.1  # Lower for more focused responses
             )
         
         if iteration >= max_iterations and response.choices[0].message.tool_calls:
