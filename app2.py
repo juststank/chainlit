@@ -327,7 +327,7 @@ def filter_relevant_tools(query: str, tools: List[dict], max_tools: int = 100) -
         'system': [
             'system', 'backup', 'restore', 'admin', 'certificate', 'interface',
             'snmp', 'syslog', 'ntp', 'dns', 'route', 'global', 'static route',
-            'routing', 'gateway'
+            'routing', 'gateway', 'routing_table', 'routing table', 'table', 'router'
         ],
         
         # Additional categories
@@ -578,18 +578,23 @@ async def on_message(message: cl.Message):
                     
                     "**Router Configuration & Static Routes:**\n"
                     "CRITICAL: Static routes are stored PER-DEVICE, not at ADOM level!\n"
+                    
+                    "CORRECT TOOL TO USE:\n"
+                    "✓ get_device_routing_table(device_name='X', adom='Y') - Gets actual routes\n"
+                    
+                    "TOOLS THAT DO NOT WORK:\n"
+                    "✗ get_device_routing_configuration - Does NOT exist or returns errors\n"
+                    "✗ list_static_routes - Does NOT exist\n"
+                    "✗ list_static_route_templates - Shows templates (empty), NOT actual routes\n"
+                    "✗ get_current_device_config - Shows device metadata, NOT routes\n\n"
+                    
                     "Workflow to get routes:\n"
                     "1. list_devices(adom='X') - Get device names\n"
-                    "2. get_device_routing_table(device_name='Y', adom='X') - Get routes for specific device\n"
-                    "3. Repeat step 2 for each device if needed\n\n"
+                    "2. get_device_routing_table(device_name='Y', adom='X') - Get routes for each device\n"
+                    "3. Repeat step 2 for each device\n\n"
                     
-                    "Available route tools:\n"
-                    "- get_device_routing_table(device_name, adom) → ACTUAL routes for specific device ✓\n"
-                    "- list_static_route_templates(adom) → Templates only (usually empty) ✗\n"
-                    "- get_device_routing_configuration → May not exist or return errors ✗\n\n"
-                    
-                    "NEVER call list_static_route_templates repeatedly - it shows templates, not routes!\n"
-                    "ALWAYS use get_device_routing_table with a specific device_name.\n\n"
+                    "If get_device_routing_table is not in available tools, tell user the tool is missing.\n"
+                    "NEVER repeatedly call list_static_route_templates - it will never have routes!\n\n"
                     
                     "**ADOM Operations:**\n"
                     "- list_adoms() - Show all ADOMs\n"
