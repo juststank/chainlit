@@ -3,7 +3,6 @@ from openai import AsyncOpenAI
 import json
 from dotenv import load_dotenv
 import os
-from fastmcp import Client
 
 # Load environment variables
 load_dotenv()
@@ -11,123 +10,60 @@ load_dotenv()
 # Initialize OpenAI client
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Global variables
-available_tools = []
-MCP_SERVER_URL = "http://127.0.0.1:8002/mcp"
-
-async def fetch_mcp_tools():
-    """Fetch available tools from FastMCP server"""
-    global available_tools
-    
-    try:
-        print(f"🔌 Connecting to MCP server at {MCP_SERVER_URL}...")
-        
-        async with Client(MCP_SERVER_URL) as mcp_client:
-            print(f"✅ Connected successfully")
-            
-            # List tools
-            tools = await mcp_client.list_tools()
-            print(f"📡 Found {len(tools)} tools")
-            
-            # Convert to OpenAI format (matching official MCP format)
-            available_tools = []
-            for tool in tools:
-                openai_tool = {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.inputSchema  # This matches the official inputSchema
-                    }
-                }
-                available_tools.append(openai_tool)
-            
-            print(f"✅ Loaded {len(available_tools)} tools")
-            print(f"📋 Tools: {[t['function']['name'] for t in available_tools]}")
-            return True
-                
-    except Exception as e:
-        print(f"❌ Error: {type(e).__name__}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-async def call_mcp_tool(tool_name: str, tool_args: dict):
-    """Execute MCP tool - similar to official client"""
-    try:
-        print(f"🔧 Calling tool {tool_name} with args {tool_args}")
-        
-        async with Client(MCP_SERVER_URL) as mcp_client:
-            # Call tool - matches official: await self.session.call_tool(tool_name, tool_args)
-            result = await mcp_client.call_tool(tool_name, tool_args)
-            
-            # Extract content - matches official: result.content
-            if hasattr(result, 'content') and result.content:
-                # Handle list of content items
-                content_parts = []
-                for item in result.content:
-                    if hasattr(item, 'text'):
-                        content_parts.append(item.text)
-                    else:
-                        content_parts.append(str(item))
-                return "\n".join(content_parts)
-            return str(result)
-                
-    except Exception as e:
-        error_msg = f"Error calling tool {tool_name}: {str(e)}"
-        print(f"❌ {error_msg}")
-        return error_msg
-
 @cl.on_chat_start
 async def start():
     """Initialize the chat session"""
-    success = await fetch_mcp_tools()
-    
     cl.user_session.set("message_history", [
-        {"role": "system", "content": "You are a helpful assistant with access to note-taking tools. Use the tools when appropriate to help users manage their notes."}
+        {"role": "system", "content": "You are a helpful assistant. Use available tools when appropriate to help users."}
     ])
     
-    if success and available_tools:
-        tool_names = [t['function']['name'] for t in available_tools]
-        await cl.Message(
-            content=f"Hello! I'm connected to your notes system. 📝\n\nAvailable tools: **{', '.join(tool_names)}**\n\nI can help you retrieve and manage your notes!"
-        ).send()
-    else:
-        await cl.Message(
-            content=f"⚠️ Could not connect to MCP server at {MCP_SERVER_URL}"
-        ).send()
+    await cl.Message(
+        content="Hello! I'm ready to help. If you've connected any MCP servers, I can use their tools to assist you."
+    ).send()
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Handle incoming messages - improved based on official client"""
+    """Handle incoming messages with MCP tool support"""
     message_history = cl.user_session.get("message_history")
     
     if not message_history:
         await cl.Message(content="⚠️ Session not initialized. Please refresh the page.").send()
         return
     
-    if not available_tools:
-        message_history.append({"role": "user", "content": message.content})
-        response = await client.chat.completions.create(model="gpt-4o", messages=message_history)
-        assistant_message = response.choices[0].message.content
-        message_history.append({"role": "assistant", "content": assistant_message})
-        await cl.Message(content=assistant_message).send()
-        return
-    
     message_history.append({"role": "user", "content": message.content})
     
     try:
-        # Initial API call with tools
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=message_history,
-            tools=available_tools,
-            tool_choice="auto"
-        )
+        # Get available MCP tools from Chainlit context
+        available_tools = []
         
+        # Check if MCP tools are available in the context
+        if hasattr(cl.context, 'mcp_tools') and cl.context.mcp_tools:
+            available_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema
+                    }
+                }
+                for tool in cl.context.mcp_tools
+            ]
+        
+        # Create initial response with or without tools
+        request_params = {
+            "model": "gpt-4o",
+            "messages": message_history,
+        }
+        
+        if available_tools:
+            request_params["tools"] = available_tools
+            request_params["tool_choice"] = "auto"
+        
+        response = await client.chat.completions.create(**request_params)
         response_message = response.choices[0].message
         
-        # Process tool calls (similar to official client loop)
+        # Process tool calls if any
         while response_message.tool_calls:
             # Add assistant's response with tool calls to history
             message_history.append({
@@ -157,23 +93,46 @@ async def main(message: cl.Message):
                     author="System"
                 ).send()
                 
-                # Call the MCP tool
-                tool_result = await call_mcp_tool(function_name, function_args)
-                
-                # Add tool result to history
-                message_history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": function_name,
-                    "content": tool_result
-                })
+                # Call the MCP tool through Chainlit's context
+                try:
+                    tool_result = await cl.context.call_mcp_tool(function_name, function_args)
+                    
+                    # Extract text from result
+                    if hasattr(tool_result, 'content') and tool_result.content:
+                        content_parts = []
+                        for item in tool_result.content:
+                            if hasattr(item, 'text'):
+                                content_parts.append(item.text)
+                            else:
+                                content_parts.append(str(item))
+                        result_text = "\n".join(content_parts)
+                    else:
+                        result_text = str(tool_result)
+                    
+                    # Add tool result to history
+                    message_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": function_name,
+                        "content": result_text
+                    })
+                    
+                except Exception as e:
+                    error_msg = f"Error executing tool: {str(e)}"
+                    print(f"❌ {error_msg}")
+                    message_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": function_name,
+                        "content": error_msg
+                    })
             
-            # Get next response from OpenAI (may trigger more tool calls)
+            # Get next response from OpenAI
             response = await client.chat.completions.create(
                 model="gpt-4o",
                 messages=message_history,
-                tools=available_tools,
-                tool_choice="auto"
+                tools=available_tools if available_tools else None,
+                tool_choice="auto" if available_tools else None
             )
             
             response_message = response.choices[0].message
