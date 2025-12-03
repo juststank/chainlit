@@ -21,41 +21,29 @@ async def start():
 
 @cl.on_mcp_connect
 async def on_mcp_connect(connection, session):
-    """Handle MCP server connections - receives connection AND session"""
+    """Handle MCP server connections"""
     print(f"🔌 MCP Connection event triggered for: {connection.name}")
     
     try:
-        # List available tools from the MCP session
-        tools_response = await session.list_tools()
-        tools = tools_response.tools
+        # List available tools
+        result = await session.list_tools()
         
-        print(f"📋 Found {len(tools)} tools: {[tool.name for tool in tools]}")
+        # Process tool metadata
+        tools = [{
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.inputSchema,
+        } for t in result.tools]
         
-        # Convert tools to OpenAI format
-        openai_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema
-                }
-            }
-            for tool in tools
-        ]
+        print(f"📋 Found {len(tools)} tools: {[t['name'] for t in tools]}")
         
-        # Store tools by connection name in user session
+        # Store tools for later use
         mcp_tools = cl.user_session.get("mcp_tools", {})
-        mcp_tools[connection.name] = openai_tools
+        mcp_tools[connection.name] = tools
         cl.user_session.set("mcp_tools", mcp_tools)
         
-        # Store the session for later tool calls
-        mcp_sessions = cl.user_session.get("mcp_sessions", {})
-        mcp_sessions[connection.name] = session
-        cl.user_session.set("mcp_sessions", mcp_sessions)
-        
         # Notify user
-        tool_names = [tool.name for tool in tools]
+        tool_names = [t['name'] for t in tools]
         await cl.Message(
             content=f"✅ **Connected to {connection.name}**\n\n🔧 Available tools:\n" + "\n".join([f"- `{name}`" for name in tool_names]),
             author="System"
@@ -75,19 +63,59 @@ async def on_mcp_disconnect(name: str):
     """Handle MCP server disconnections"""
     print(f"🔌 MCP server '{name}' disconnected")
     
-    # Remove tools and session from user session
+    # Remove tools from user session
     mcp_tools = cl.user_session.get("mcp_tools", {})
     mcp_tools.pop(name, None)
     cl.user_session.set("mcp_tools", mcp_tools)
-    
-    mcp_sessions = cl.user_session.get("mcp_sessions", {})
-    mcp_sessions.pop(name, None)
-    cl.user_session.set("mcp_sessions", mcp_sessions)
     
     await cl.Message(
         content=f"❌ Disconnected from **{name}**",
         author="System"
     ).send()
+
+def find_mcp_for_tool(tool_name: str) -> str:
+    """Find which MCP connection has the given tool"""
+    mcp_tools = cl.user_session.get("mcp_tools", {})
+    
+    for connection_name, tools in mcp_tools.items():
+        if any(t['name'] == tool_name for t in tools):
+            return connection_name
+    
+    raise ValueError(f"Tool {tool_name} not found in any MCP connection")
+
+@cl.step(type="tool")
+async def call_mcp_tool(tool_name: str, tool_input: dict):
+    """Execute MCP tool - following Chainlit documentation pattern"""
+    try:
+        # Find appropriate MCP connection for this tool
+        mcp_name = find_mcp_for_tool(tool_name)
+        
+        # Get the MCP session from context
+        mcp_session, _ = cl.context.session.mcp_sessions.get(mcp_name)
+        
+        print(f"🔧 Calling tool {tool_name} on connection {mcp_name}")
+        
+        # Call the tool
+        result = await mcp_session.call_tool(tool_name, tool_input)
+        
+        # Extract text from result
+        if hasattr(result, 'content') and result.content:
+            result_text = "\n".join([
+                item.text if hasattr(item, 'text') else str(item)
+                for item in result.content
+            ])
+        else:
+            result_text = str(result)
+        
+        print(f"✅ Tool {tool_name} executed successfully")
+        return result_text
+        
+    except Exception as e:
+        error_msg = f"Error calling tool {tool_name}: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return error_msg
 
 @cl.on_message
 async def main(message: cl.Message):
@@ -95,13 +123,24 @@ async def main(message: cl.Message):
     message_history = cl.user_session.get("message_history", [])
     message_history.append({"role": "user", "content": message.content})
     
-    # Get all tools from all connected MCP servers
+    # Get tools from all MCP connections (following documentation)
     mcp_tools = cl.user_session.get("mcp_tools", {})
-    all_tools = []
-    for connection_tools in mcp_tools.values():
-        all_tools.extend(connection_tools)
+    all_tools = [tool for connection_tools in mcp_tools.values() for tool in connection_tools]
     
-    print(f"📊 Available tools: {len(all_tools)}")
+    # Convert to OpenAI format
+    openai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"]
+            }
+        }
+        for tool in all_tools
+    ]
+    
+    print(f"📊 Available tools: {len(openai_tools)}")
     
     try:
         # Call OpenAI with or without tools
@@ -110,8 +149,8 @@ async def main(message: cl.Message):
             "messages": message_history
         }
         
-        if all_tools:
-            params["tools"] = all_tools
+        if openai_tools:
+            params["tools"] = openai_tools
             params["tool_choice"] = "auto"
         
         response = await client.chat.completions.create(**params)
@@ -137,44 +176,17 @@ async def main(message: cl.Message):
             })
             
             # Execute each tool call
-            mcp_sessions = cl.user_session.get("mcp_sessions", {})
-            
             for tool_call in response_message.tool_calls:
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
-                
-                print(f"🔧 Calling tool: {function_name} with args: {function_args}")
                 
                 await cl.Message(
                     content=f"🔧 Calling: `{function_name}`\n```json\n{json.dumps(function_args, indent=2)}\n```",
                     author="System"
                 ).send()
                 
-                # Try to find and call the tool from any connected MCP session
-                result_text = None
-                for session_name, session in mcp_sessions.items():
-                    try:
-                        # Call the tool through the MCP session
-                        result = await session.call_tool(function_name, function_args)
-                        
-                        # Extract text from result
-                        if hasattr(result, 'content') and result.content:
-                            result_text = "\n".join([
-                                item.text if hasattr(item, 'text') else str(item)
-                                for item in result.content
-                            ])
-                        else:
-                            result_text = str(result)
-                        
-                        print(f"✅ Tool {function_name} executed successfully")
-                        break
-                        
-                    except Exception as tool_error:
-                        print(f"⚠️ Failed to call {function_name} on {session_name}: {tool_error}")
-                        continue
-                
-                if result_text is None:
-                    result_text = f"Error: Tool {function_name} not found in any connected MCP server"
+                # Call the MCP tool using the documented pattern
+                result_text = await call_mcp_tool(function_name, function_args)
                 
                 # Add tool result to history
                 message_history.append({
@@ -188,8 +200,8 @@ async def main(message: cl.Message):
             response = await client.chat.completions.create(
                 model="gpt-4o",
                 messages=message_history,
-                tools=all_tools if all_tools else None,
-                tool_choice="auto" if all_tools else None
+                tools=openai_tools if openai_tools else None,
+                tool_choice="auto" if openai_tools else None
             )
             response_message = response.choices[0].message
         
