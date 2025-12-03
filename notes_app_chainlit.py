@@ -20,15 +20,12 @@ async def start():
     ).send()
 
 @cl.on_mcp_connect
-async def on_mcp_connect(connection):
-    """Handle MCP server connections"""
+async def on_mcp_connect(connection, session):
+    """Handle MCP server connections - receives connection AND session"""
     print(f"🔌 MCP Connection event triggered for: {connection.name}")
     
     try:
-        # Get the MCP session from the connection
-        session = connection.session
-        
-        # List available tools from the MCP server
+        # List available tools from the MCP session
         tools_response = await session.list_tools()
         tools = tools_response.tools
         
